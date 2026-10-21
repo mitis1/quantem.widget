@@ -14,6 +14,7 @@ from ase import Atoms
 import quantem.widget as qw
 from quantem.widget.export import write_widget_html
 from quantem.widget.showpdf import _pdf_class
+from quantem.widget.showstrain import _workflow_class
 
 pytestmark = pytest.mark.browser
 
@@ -43,6 +44,20 @@ def _showpdf():
 try:  # ShowPDF needs quantem's PairDistributionFunction API (quantem pull request 248)
     _pdf_class()
     WIDGETS["showpdf"] = _showpdf
+except ImportError:
+    pass
+
+
+def _showstrain():
+    rr, cc = np.mgrid[0:32, 0:32]
+    pattern = sum(np.exp(-((rr - 16 - 8 * h) ** 2 + (cc - 16 - 8 * k) ** 2) / 2.0)
+                  for h in (-1, 0, 1) for k in (-1, 0, 1)).astype(np.float32)
+    return qw.ShowStrain(np.broadcast_to(pattern, (2, 2, 32, 32)).copy(), device="cpu", g1=(4, 0), g2=(0, 4))
+
+
+try:  # ShowStrain needs quantem's StrainMapAutocorrelation
+    _workflow_class()
+    WIDGETS["showstrain"] = _showstrain
 except ImportError:
     pass
 # The widget's own DOM inside the embed's view container: anywidget renders into it

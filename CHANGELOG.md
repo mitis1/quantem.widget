@@ -6,6 +6,14 @@ new `rcN` heading when that rc is published to TestPyPI.
 
 ## Unreleased
 
+- Add `ShowStrain` for cepstral strain mapping of 4D-STEM data on top of
+  `quantem.diffraction.StrainMapAutocorrelation`: tune the detector mask and
+  intensity transform, click or drag two lattice vectors on the mean
+  transform, choose the peaks of the multi-peak fit with threshold and spacing
+  sliders (previewed live while dragging), and fit every scan position on the
+  requested device for the `e_rr`, `e_cc`, `e_rc` and `phi` maps. It needs a
+  quantem build with `StrainMapAutocorrelation`, which is not released yet. Its
+  tutorial (`docs/tutorials/showstrain.ipynb`) joins the docs after that release.
 - Add `ShowPDF` for pair distribution function analysis of 4D-STEM data: select
   scan regions (mask, probe, line, or line scan) and tune the background fit,
   k window, filters, and low-r damping on top of

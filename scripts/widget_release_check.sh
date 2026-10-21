@@ -66,6 +66,7 @@ required = {
     "quantem/widget/static/showcif.js",
     "quantem/widget/static/showdiffraction.js",
     "quantem/widget/static/showpdf.js",
+    "quantem/widget/static/showstrain.js",
     "quantem/widget/static/showptycho.js",
 }
 with zipfile.ZipFile(wheel) as zf:

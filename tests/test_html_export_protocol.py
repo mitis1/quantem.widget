@@ -20,9 +20,16 @@ try:  # ShowPDF needs quantem's PairDistributionFunction API (quantem pull reque
 except ImportError:
     ShowPDF = None
 
+from quantem.widget.showstrain import ShowStrain, _workflow_class
+
+try:  # ShowStrain needs quantem's StrainMapAutocorrelation
+    _workflow_class()
+except ImportError:
+    ShowStrain = None
+
 EXPORT_WIDGET_CLASSES = (Show1D, Show2D, Show3D, Show3DSlices, Show4DSTEM, ShowDiffraction) + (
     (ShowPDF,) if ShowPDF is not None else ()
-)
+) + ((ShowStrain,) if ShowStrain is not None else ())
 
 
 def _show1d() -> Show1D:
@@ -89,6 +96,14 @@ def _showpdf():
     return ShowPDF(data, title="Protocol ShowPDF", find_origin=False, origin_row=7.5, origin_col=7.5)
 
 
+def _showstrain():
+    rr, cc = np.mgrid[0:32, 0:32]
+    pattern = sum(np.exp(-((rr - 16 - 8 * h) ** 2 + (cc - 16 - 8 * k) ** 2) / 2.0)
+                  for h in (-1, 0, 1) for k in (-1, 0, 1)).astype(np.float32)
+    data = np.broadcast_to(pattern, (2, 2, 32, 32)).copy()
+    return ShowStrain(data, title="Protocol ShowStrain", device="cpu", g1=(4, 0), g2=(0, 4))
+
+
 EXPORT_WIDGET_CASES = (
     pytest.param(_show1d, {"encoding": "full"}, {"mode": "single", "encoding": "full"}, "Protocol Show1D", id="show1d"),
     pytest.param(_show2d, {"encoding": "full"}, {"mode": "single", "encoding": "full"}, "Protocol Show2D", id="show2d"),
@@ -99,6 +114,10 @@ EXPORT_WIDGET_CASES = (
 ) + (
     (pytest.param(_showpdf, {"encoding": "uint8"}, {"mode": "single", "encoding": "uint8"}, "Protocol ShowPDF", id="showpdf"),)
     if ShowPDF is not None
+    else ()
+) + (
+    (pytest.param(_showstrain, {}, {"mode": "single"}, "Protocol ShowStrain", id="showstrain"),)
+    if ShowStrain is not None
     else ()
 )
 

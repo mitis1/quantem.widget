@@ -50,6 +50,7 @@ readers and test agents.
 | [ShowPtycho](showptycho) | `quantem.widget.ShowPtycho` | ptychography state JSON, WebGPU folder export with BF-indexed `G(k)` payload |
 | [ShowDiffraction](showdiffraction) | `quantem.widget.showdiffraction.ShowDiffraction` | state JSON, PNG, interactive HTML |
 | [ShowPDF](showpdf) | `quantem.widget.showpdf.ShowPDF` | state JSON, results zip (CSV), PNG/PDF/TIFF curves, interactive HTML (`encoding="full"` / `encoding="uint8"`) |
+| [ShowStrain](showstrain) | `quantem.widget.showstrain.ShowStrain` | state JSON, interactive HTML (float32 transform and strain maps; parameter controls locked) |
 | [ChooseLattice](choose-lattice) | `quantem.widget.choose_lattice.ChooseLattice` | state JSON (`save_state=True`) |
 | [ShowCIF](showcif) | `quantem.widget.ShowCIF` | Interactive HTML with embedded coordinates; CDN widget manager requires network |
 

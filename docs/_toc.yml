@@ -76,6 +76,7 @@ parts:
           - file: api/showptycho
           - file: api/showdiffraction
           - file: api/showpdf
+          - file: api/showstrain
           - file: api/choose-lattice
           - file: api/showcif
           - file: api/html-export

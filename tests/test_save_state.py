@@ -46,6 +46,13 @@ try:  # ShowPDF needs quantem's PairDistributionFunction API (quantem pull reque
 except ImportError:
     ShowPDF = None
 
+from quantem.widget.showstrain import ShowStrain, _workflow_class
+
+try:  # ShowStrain needs quantem's StrainMapAutocorrelation
+    _workflow_class()
+except ImportError:
+    ShowStrain = None
+
 
 IMAGE_MIME_KEYS = ("image/jpeg", "image/webp", "image/png")
 
@@ -113,13 +120,23 @@ def _make(widget, *, save_state):
         data = np.broadcast_to(pattern, (4, 4, 16, 16)).copy()
         return ShowPDF(data, find_origin=False, origin_row=7.5, origin_col=7.5,
                        save_state=save_state), "nav_image_bytes"
+    if widget is ShowStrain:
+        rr, cc = np.mgrid[0:32, 0:32]
+        pattern = sum(np.exp(-((rr - 16 - 8 * h) ** 2 + (cc - 16 - 8 * k) ** 2) / 2.0)
+                      for h in (-1, 0, 1) for k in (-1, 0, 1)).astype("float32")
+        data = np.broadcast_to(pattern, (4, 4, 32, 32)).copy()
+        return ShowStrain(data, device="cpu", g1=(4, 0), g2=(0, 4), save_state=save_state), "transform_bytes"
     return Show4DSTEM(np.random.rand(8, 8, 16, 16).astype("float32"),
                       save_state=save_state), "virtual_image_bytes"
 
 
-WIDGETS = [Plot2D, Show1D, Show2D, Show3D, Show4DSTEM] + ([ShowPDF] if ShowPDF is not None else [])
-# Line plots keep a lossless PNG preview; the image viewers a JPEG.
-PNG_PREVIEW_WIDGETS = (Plot2D, ShowPDF)
+WIDGETS = (
+    [Plot2D, Show1D, Show2D, Show3D, Show4DSTEM]
+    + ([ShowPDF] if ShowPDF is not None else [])
+    + ([ShowStrain] if ShowStrain is not None else [])
+)
+# Line plots and annotated analysis views keep a lossless PNG preview; the image viewers a JPEG.
+PNG_PREVIEW_WIDGETS = (Plot2D, ShowPDF, ShowStrain)
 
 
 @pytest.mark.parametrize("widget", WIDGETS)

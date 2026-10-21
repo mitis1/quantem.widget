@@ -24,6 +24,7 @@ const widgets = [
   "show4dstem",
   "showdiffraction",
   "showpdf",
+  "showstrain",
   "showptycho",
   "chooselattice",
   "showcif",
