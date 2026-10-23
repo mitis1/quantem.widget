@@ -42,8 +42,13 @@ _REQUIREMENT = (
 )
 MODES = ("linear", "log", "log-min", "gamma")
 FIT_METHODS = ("gaussian", "cft")
-# The four StrainMap components, in the order of strain_bytes.
-STRAIN_COMPONENTS = ("e_rr", "e_cc", "e_rc", "phi")
+# The shown strain components, in the order of strain_bytes: plot_strain's e_uu, e_vv, e_uv in the
+# frame rotated by rotation_angle (e_rr, e_cc, e_rc at 0), the planar strain e_uu + e_vv
+# (plot_strain(plot_dilation=True)), and the rotation phi (radians).
+STRAIN_COMPONENTS = ("e_uu", "e_vv", "e_uv", "planar", "phi")
+REAL_SPACE_MODES = ("adf", "bf")
+# The virtual bright-field disk is the central beam grown by this margin, as in the strain notebooks.
+_BF_MARGIN_PX = 2.0
 # |sin| of the angle between the picked vectors below which they are refused as collinear (~3 degrees).
 _MIN_BASIS_SINE = 0.05
 
@@ -65,8 +70,8 @@ _FIT_TRAITS = ("fit_method", "fit_refine_radius_px", "refine_dft", "upsample", "
 _REFERENCE_TRAITS = ("reference_region", "calculation_metric", "rotation_angle")
 # Display-only settings; saved with the state but never recomputed.
 _DISPLAY_TRAITS = (
-    "cropping_factor", "strain_range_percent", "rotation_range_degrees", "mask_range", "title",
-    "peak_color", "peak_line_width", "peak_size",
+    "cropping_factor", "strain_range_percent", "rotation_range_degrees", "apply_mask", "mask_range", "title",
+    "peak_color", "peak_line_width", "peak_size", "show_diffraction",
 )
 _STATE_KEYS = _PREPROCESS_TRAITS + _LATTICE_TRAITS + _FIT_TRAITS + _REFERENCE_TRAITS + _DISPLAY_TRAITS
 CALCULATION_METRICS = ("median", "mean")
@@ -182,13 +187,18 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
     """
 
     _esm = pathlib.Path(__file__).parent / "static" / "showstrain.js"
-    _static_fallback_jpeg = traitlets.Unicode("").tag(sync=True)
+    _static_fallback_image = traitlets.Unicode("").tag(sync=True)
     _static_fallback_mime = traitlets.Unicode("image/png").tag(sync=True)
-    _UNSAVED_HEAVY_KEYS = ("transform_bytes", "dp_bytes", "mask_bytes", "strain_bytes", "weight_bytes", "export_payload")
+    _UNSAVED_HEAVY_KEYS = (
+        "transform_bytes", "dp_bytes", "dp_fft_bytes", "mask_bytes", "strain_bytes", "weight_bytes", "real_space_bytes",
+        "export_payload",
+    )
 
     widget_version = traitlets.Unicode("unknown").tag(sync=True)
     title = traitlets.Unicode("").tag(sync=True)
     show_controls = traitlets.Bool(True).tag(sync=True)
+    # The right panel (mean diffraction pattern / its Fourier transform) beside the cepstral transform.
+    show_diffraction = traitlets.Bool(True).tag(sync=True)
     offline = traitlets.Bool(False).tag(sync=True)
 
     # --- data shapes and calibration (Python -> browser) ---
@@ -244,13 +254,25 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
     cropping_factor = traitlets.Float(0.25).tag(sync=True)
     strain_range_percent = traitlets.List(traitlets.Float(), default_value=[-3.0, 3.0], minlen=2, maxlen=2).tag(sync=True)
     rotation_range_degrees = traitlets.List(traitlets.Float(), default_value=[-2.0, 2.0], minlen=2, maxlen=2).tag(sync=True)
-    mask_range = traitlets.List(traitlets.Float(), default_value=[0.0, 1.0], minlen=2, maxlen=2).tag(sync=True)
+    # plot_strain(mask_range=...) dimming of low-weight positions, applied only while apply_mask is on.
+    # Off by default; passing mask_range turns it on. The default window starts at (0, 0.01), so
+    # switching it on changes almost nothing until the slider moves.
+    apply_mask = traitlets.Bool(False).tag(sync=True)
+    mask_range = traitlets.List(traitlets.Float(), default_value=[0.0, 0.01], minlen=2, maxlen=2).tag(sync=True)
+    # Virtual real-space image of the scan: "" until first asked for, then "adf" or "bf".
+    real_space_mode = traitlets.Unicode("").tag(sync=True)
+    real_space_bytes = traitlets.Bytes(b"").tag(sync=True)
+    real_space_info = traitlets.Unicode("").tag(sync=True)
     peak_color = traitlets.Unicode("#ffd54f").tag(sync=True)
     peak_line_width = traitlets.Float(1.5).tag(sync=True)
     peak_size = traitlets.Float(1.0).tag(sync=True)
 
     # --- results (Python -> browser) ---
     dp_bytes = traitlets.Bytes(b"").tag(sync=True)
+    # |FFT| of the mean diffraction pattern (fft-shifted, no intensity scaling or mask): the plain
+    # Fourier transform to compare the cepstral transform against.
+    dp_fft_bytes = traitlets.Bytes(b"").tag(sync=True)
+    dp_fft_vmax = traitlets.Float(1.0).tag(sync=True)
     mask_bytes = traitlets.Bytes(b"").tag(sync=True)
     transform_bytes = traitlets.Bytes(b"").tag(sync=True)
     transform_vmax = traitlets.Float(1.0).tag(sync=True)
@@ -305,6 +327,8 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             self.scan_sampling = float(dataset.sampling[0])
             self.scan_units = str(dataset.units[0])
             self.title = str(kwargs.pop("title", "") or getattr(dataset, "name", "") or "")
+            if "mask_range" in kwargs and "apply_mask" not in kwargs:
+                kwargs["apply_mask"] = True
             for name, value in kwargs.items():
                 as_list = ("g1", "g2", "strain_range_percent", "rotation_range_degrees", "mask_range", "reference_region")
                 setattr(self, name, list(value) if name in as_list else value)
@@ -312,12 +336,16 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             dp_mean = getattr(dataset, "dp_mean", None)
             dp_mean = np.mean(dataset.array, axis=(0, 1)) if dp_mean is None else core_adapter.as_array(dp_mean)
             self.dp_bytes = _b64_safe(np.asarray(dp_mean, dtype=np.float32).tobytes())
+            dp_fft = np.abs(np.fft.fftshift(np.fft.fft2(np.asarray(dp_mean, dtype=np.float64))))
+            self.dp_fft_bytes = _b64_safe(dp_fft.astype(np.float32).tobytes())
+            self.dp_fft_vmax = _brightest_lattice_peak(dp_fft)
         self._initializing = False
         self.observe(self._on_export_request_change, names=["export_request"])
         self.observe(self._invalidate_preview, names=list(_PREVIEW_TRAITS))
         self.observe(self._on_parameter_change, names=list(_PREPROCESS_TRAITS + _LATTICE_TRAITS + _FIT_TRAITS))
         self.observe(self._on_fit_request, names=["fit_request"])
         self.observe(self._on_reference_change, names=list(_REFERENCE_TRAITS))
+        self.observe(self._on_real_space_mode, names=["real_space_mode"])
         self._run(preprocess=True)
 
     # ------------------------------------------------------------------
@@ -580,7 +608,8 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         strain.update_reference(strain_mask=mask, calculation_metric=self.calculation_metric)
         # plot_strain(rotation_angle=...): the tensor in a frame rotated by the angle; phi is invariant
         e_uu, e_vv, e_uv = strain.rotate_strain(self.rotation_angle)
-        maps = np.stack([np.asarray(m, dtype=np.float32) for m in (e_uu, e_vv, e_uv, strain.phi.array)])
+        planar = e_uu + e_vv
+        maps = np.stack([np.asarray(m, dtype=np.float32) for m in (e_uu, e_vv, e_uv, planar, strain.phi.array)])
         if mask is None:
             message = f"Reference: {self.calculation_metric} weighted by the fit amplitude (mask_weight)"
         else:
@@ -621,9 +650,62 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             self.warning_messages = list(dict.fromkeys(str(w.message) for w in caught))
             self.status_message = message or ""
         except Exception as exc:  # the widget shows it; the kernel keeps running
+            exc.__traceback__ = None  # quantem's frames (full-size arrays) must not outlive the error
             self.status_message = f"Error: {exc}"
+        except KeyboardInterrupt:
+            # IPython keeps the last traceback for %debug; quantem's frames in it hold full-size
+            # arrays (a float64 copy of the scan in preprocess) that nothing could free until the
+            # kernel restarts. Re-raise without them.
+            self.status_message = "Interrupted"
+            raise KeyboardInterrupt("ShowStrain step interrupted") from None
         finally:
             self.computing = False
+
+    @traitlets.validate("real_space_mode")
+    def _validate_real_space_mode(self, proposal):
+        """"" (not computed yet), "adf" or "bf"."""
+        value = str(proposal["value"]).strip().lower()
+        if value and value not in REAL_SPACE_MODES:
+            raise traitlets.TraitError(f"real_space_mode must be one of {REAL_SPACE_MODES}, got {proposal['value']!r}.")
+        return value
+
+    def _on_real_space_mode(self, change):
+        """The Real space tab asked for (or switched) the virtual image."""
+        if self._initializing or not self.real_space_mode or self._workflow is None:
+            return
+        self._compute("Computing real-space image...", self._real_space_image)
+
+    def _real_space_image(self) -> str:
+        """Virtual ADF or BF image of the scan, on the central-beam geometry quantem estimates.
+
+        The detector is quantem's: ``estimate_central_beam`` on the mean pattern, a bright-field
+        disk of that radius plus ``_BF_MARGIN_PX``, and the annulus outside it for ADF, as the
+        strain notebooks build ``get_virtual_image``. The masked sum runs over blocks of scan rows
+        rather than ``array * mask`` at once, so a memory-mapped scan is never copied whole.
+        """
+        from quantem.diffraction.disk_detection import estimate_central_beam
+
+        dataset = self._workflow.dataset
+        start = time.perf_counter()
+        dp_mean = np.frombuffer(self.dp_bytes, np.float32, self.dp_rows * self.dp_cols).reshape(self.dp_rows, self.dp_cols)
+        (center_row, center_col), radius = estimate_central_beam(dp_mean)
+        rr, cc = np.mgrid[: self.dp_rows, : self.dp_cols]
+        inside = (rr - center_row) ** 2 + (cc - center_col) ** 2 <= (radius + _BF_MARGIN_PX) ** 2
+        detector = (inside if self.real_space_mode == "bf" else ~inside).astype(np.float32)
+        array = dataset.array
+        image = np.empty((self.scan_rows, self.scan_cols), dtype=np.float64)
+        step = max(1, int(256 * 1024**2 // max(1, array[0].nbytes)))  # ~256 MB of patterns per block
+        for row in range(0, self.scan_rows, step):
+            block = np.asarray(array[row : row + step], dtype=np.float32)
+            image[row : row + step] = np.tensordot(block, detector, axes=([2, 3], [0, 1]))
+        elapsed = (time.perf_counter() - start) * 1e3
+        name = "BF" if self.real_space_mode == "bf" else "ADF"
+        info = (f"Virtual {name}: center ({center_row:.1f}, {center_col:.1f}) px, "
+                f"{'r <= ' if name == 'BF' else 'r > '}{radius + _BF_MARGIN_PX:.1f} px")
+        with self.hold_sync():
+            self.real_space_bytes = _b64_safe(image.astype(np.float32).tobytes())
+            self.real_space_info = info
+        return f"{info} in {elapsed / 1e3:.1f} s"
 
     def _preprocess(self) -> str:
         """The detector mask and the mean transform, as ``diffraction_mask`` + ``preprocess``."""
@@ -815,10 +897,6 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             print("ShowStrain: closed the previous widget on this dataset (close_previous=False keeps it open)")
         registry[key] = weakref.ref(self)
 
-    def _strain_labels(self) -> tuple[str, ...]:
-        """Component names of ``strain_bytes``: scan-frame ``e_rr, e_cc, e_rc``, or ``e_uu, e_vv, e_uv`` once rotated."""
-        return STRAIN_COMPONENTS if self.rotation_angle == 0 else ("e_uu", "e_vv", "e_uv", "phi")
-
     def _mark_fit_stale(self) -> None:
         """Parameters changed after a fit: the shown strain no longer matches them."""
         if self.strain_bytes:
@@ -829,7 +907,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
     # ------------------------------------------------------------------
     def _invalidate_preview(self, change=None) -> None:
         """Drop the cached preview so the next save redraws it."""
-        self._static_fallback_jpeg = ""
+        self._static_fallback_image = ""
 
     def _static_png_b64(self, max_px: int = 512) -> str | None:
         """The transform with the refined vectors and, after a fit, the strain maps, as a base64 PNG."""
@@ -842,7 +920,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         if has_strain:
             grid = figure.add_gridspec(1, 2)
             axes = figure.add_subplot(grid[0])
-            strain_grid = grid[1].subgridspec(1, len(STRAIN_COMPONENTS))
+            strain_grid = grid[1].subgridspec(1, 4)
         else:
             axes = figure.add_subplot()
         image = np.asarray(work.transform.array)
@@ -865,17 +943,19 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         axes.set_yticks([])
         if has_strain:
             # the shown maps: reference and frame rotation applied
-            maps = np.frombuffer(self.strain_bytes, np.float32, 4 * self.scan_rows * self.scan_cols)
-            maps = maps.reshape(4, self.scan_rows, self.scan_cols)
-            for index, name in enumerate(self._strain_labels()):
+            count = len(STRAIN_COMPONENTS)
+            maps = np.frombuffer(self.strain_bytes, np.float32, count * self.scan_rows * self.scan_cols)
+            maps = maps.reshape(count, self.scan_rows, self.scan_cols)
+            for index, name in enumerate(("e_uu", "e_vv", "e_uv", "phi")):
                 ax = figure.add_subplot(strain_grid[index])
-                values = maps[index]
+                values = maps[STRAIN_COMPONENTS.index(name)]
                 if name == "phi":
                     values, (vmin, vmax), unit = np.degrees(values), self.rotation_range_degrees, "deg"
                 else:
                     values, (vmin, vmax), unit = values * 100.0, self.strain_range_percent, "%"
-                ax.imshow(values, cmap=ListedColormap(colormap_lut("RdBu_r")), vmin=vmin, vmax=vmax,
-                          interpolation="nearest")
+                # plot_strain's defaults: cmap_strain="RdBu_r", cmap_rotation="PiYG"
+                cmap = "PiYG" if name == "phi" else ListedColormap(colormap_lut("RdBu_r"))
+                ax.imshow(values, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
                 ax.set_title(f"{name} ({unit})", fontsize=8)
                 ax.set_xticks([])
                 ax.set_yticks([])
@@ -936,7 +1016,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         if isinstance(model_state, dict):
             model_state.update(
                 export_enabled=False, export_request="", export_status="", export_payload_id="",
-                export_filename="", _static_fallback_jpeg="", offline=True, computing=False,
+                export_filename="", _static_fallback_image="", offline=True, computing=False,
             )
             buffers = [b for b in entry.get("buffers", []) if (b.get("path") or [None])[0] != "export_payload"]
             buffers.append(_base64_buffer("export_payload", b""))

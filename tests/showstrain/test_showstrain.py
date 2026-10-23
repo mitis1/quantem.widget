@@ -128,10 +128,15 @@ def test_fit_returns_the_workflow_strain_map_and_goes_stale_on_change():
         warnings.simplefilter("ignore")
         work.fit_lattice_vectors(refine_radius_px=1.5, refine_all_peaks=True, device="cpu", progressbar=False)
     expected = work.calculate_strain_map()
-    maps = np.frombuffer(widget.strain_bytes, np.float32, 4 * 30).reshape(4, 6, 5)
-    for index, name in enumerate(STRAIN_COMPONENTS):
+    maps = np.frombuffer(widget.strain_bytes, np.float32, 5 * 30).reshape(5, 6, 5)
+    # shown: e_uu, e_vv, e_uv (= e_rr, e_cc, e_rc at frame angle 0), planar e_uu + e_vv, rotation phi
+    shown = {"e_uu": expected.e_rr.array, "e_vv": expected.e_cc.array, "e_uv": expected.e_rc.array,
+             "planar": expected.e_rr.array + expected.e_cc.array, "phi": expected.phi.array}
+    assert tuple(shown) == STRAIN_COMPONENTS
+    for name in ("e_rr", "e_cc", "e_rc", "phi"):
         np.testing.assert_allclose(getattr(strain, name).array, getattr(expected, name).array, atol=1e-12)
-        np.testing.assert_array_equal(maps[index], getattr(expected, name).array.astype(np.float32))
+    for index, values in enumerate(shown.values()):
+        np.testing.assert_allclose(maps[index], values.astype(np.float32), atol=1e-7)
     # e_cc follows the synthetic ramp: it increases monotonically along the scan columns
     assert np.all(np.diff(strain.e_cc.array.mean(axis=0)) > 0)
     assert widget.strain_map is strain and not widget.fit_stale
@@ -202,13 +207,14 @@ def test_export_html_holds_the_view_but_not_the_scan(tmp_path):
     path = widget.export_html(tmp_path / "strain.html")
     html = path.read_text()
     assert '"offline": true' in html and '"export_enabled": false' in html
-    # only the float32 views travel: transform, mean pattern, mask, four strain maps and the weight
+    # only the float32 views travel: transform, mean pattern and its |FFT|, mask, strain maps, weight, real space
     state = json.loads(html.split('<script type="application/vnd.jupyter.widget-state+json">')[1].split("</script>")[0])
     entry = state["state"][widget.model_id]
     names = {buffer["path"][0] for buffer in entry["buffers"] if buffer["data"]}
-    assert names <= {"transform_bytes", "dp_bytes", "mask_bytes", "peaks_bytes", "strain_bytes", "weight_bytes"}
+    assert names <= {"transform_bytes", "dp_bytes", "dp_fft_bytes", "mask_bytes", "peaks_bytes", "strain_bytes", "weight_bytes",
+                     "real_space_bytes"}
     embedded = sum(len(buffer["data"]) * 3 // 4 for buffer in entry["buffers"])
-    assert embedded < 3 * 64 * 64 * 4 + 5 * 30 * 4 + 64  # vs DATA.nbytes = 30 * 64 * 64 * 4
+    assert embedded < 4 * 64 * 64 * 4 + 7 * 30 * 4 + 64  # vs DATA.nbytes = 30 * 64 * 64 * 4
     assert widget.offline is False and widget.export_enabled is True
 
 
@@ -226,7 +232,7 @@ def test_reference_region_matches_update_reference_without_refitting():
     mask[:, 0:2] = True
     reference.update_reference(strain_mask=mask)
     np.testing.assert_array_equal(widget.workflow.g1_array, fitted)  # no refit
-    maps = np.frombuffer(widget.strain_bytes, np.float32, 4 * 30).reshape(4, 6, 5)
+    maps = np.frombuffer(widget.strain_bytes, np.float32, 5 * 30).reshape(5, 6, 5)
     np.testing.assert_allclose(maps[1], reference.e_cc.array.astype(np.float32), atol=1e-7)
     np.testing.assert_allclose(widget.reference_vectors, [reference.g1_ref, reference.g2_ref])
     assert widget.reference_message.startswith("Reference: median over rows 0-5, cols 0-1 (12 positions)")
@@ -234,7 +240,7 @@ def test_reference_region_matches_update_reference_without_refitting():
     assert abs(maps[1][:, :2].mean()) < abs(maps[1][:, -1].mean()) and maps[1][:, -1].mean() > 0
     widget.calculation_metric = "mean"
     reference.update_reference(strain_mask=mask, calculation_metric="mean")
-    np.testing.assert_allclose(np.frombuffer(widget.strain_bytes, np.float32, 30 * 4).reshape(4, 6, 5)[1],
+    np.testing.assert_allclose(np.frombuffer(widget.strain_bytes, np.float32, 30 * 5).reshape(5, 6, 5)[1],
                                reference.e_cc.array.astype(np.float32), atol=1e-7)
     widget.reference_region = []
     assert widget.reference_message.startswith("Reference: mean weighted by the fit amplitude")
@@ -252,10 +258,10 @@ def test_frame_rotation_is_plot_strains_rotate_strain():
     strain = widget.fit()
     widget.rotation_angle = 12.0
     e_uu, e_vv, e_uv = strain.rotate_strain(12.0)
-    maps = np.frombuffer(widget.strain_bytes, np.float32, 4 * 30).reshape(4, 6, 5)
-    for index, values in enumerate((e_uu, e_vv, e_uv, strain.phi.array)):
+    maps = np.frombuffer(widget.strain_bytes, np.float32, 5 * 30).reshape(5, 6, 5)
+    for index, values in enumerate((e_uu, e_vv, e_uv, e_uu + e_vv, strain.phi.array)):
         np.testing.assert_allclose(maps[index], values.astype(np.float32), atol=1e-7)
-    assert widget._strain_labels() == ("e_uu", "e_vv", "e_uv", "phi") and not widget.fit_stale
+    assert not widget.fit_stale
 
 
 def test_fit_radius_is_separate_from_the_lattice_radius():
@@ -338,3 +344,58 @@ def test_rerunning_the_cell_closes_the_widget_it_replaces(capsys):
     for widget in (second, other, kept):
         widget.close()
         assert widget.comm is None and widget.workflow is None
+
+
+def test_real_space_tab_matches_quantems_virtual_images():
+    from quantem.core.datastructures import Dataset4dstem
+    from quantem.diffraction.disk_detection import estimate_central_beam
+
+    dataset = Dataset4dstem.from_array(DATA)
+    widget = ShowStrain(dataset, device="cpu")
+    assert widget.real_space_bytes == b""  # nothing computed until the tab asks
+    (row, col), radius = estimate_central_beam(np.mean(DATA, axis=(0, 1)))
+    for mode, detector in (("adf", ("annular", ((row, col), (radius + 2.0, 1e9)))), ("bf", ("circle", ((row, col), radius + 2.0)))):
+        widget.real_space_mode = mode  # the Real space tab, then its Detector menu
+        expected = dataset.get_virtual_image(mode=detector[0], geometry=detector[1], attach=False).array
+        shown = np.frombuffer(widget.real_space_bytes, np.float32, 30).reshape(6, 5)
+        np.testing.assert_allclose(shown, expected.astype(np.float32), rtol=1e-5)
+        assert widget.real_space_info.startswith(f"Virtual {mode.upper()}: center")
+
+
+def test_strain_mask_toggle_starts_off_unless_a_range_is_given():
+    widget = ShowStrain(DATA, device="cpu")
+    assert widget.apply_mask is False and widget.mask_range == [0.0, 0.01]
+    widget = ShowStrain(DATA, device="cpu", mask_range=(0.2, 0.25))
+    assert widget.apply_mask is True and widget.mask_range == [0.2, 0.25]
+    widget = ShowStrain(DATA, device="cpu", mask_range=(0.2, 0.25), apply_mask=False)
+    assert widget.apply_mask is False
+
+
+def test_an_interrupted_step_keeps_no_quantem_frames_alive():
+    widget = ShowStrain(DATA, device="cpu", **SEEDS)
+
+    def interrupted_preprocess(**kwargs):
+        scratch = np.ones(1_000_000)  # stands in for preprocess's full-size intermediates  # noqa: F841
+        raise KeyboardInterrupt
+
+    widget.workflow.preprocess = interrupted_preprocess
+    with pytest.raises(KeyboardInterrupt) as raised:
+        widget.mode = "log"
+    error = raised.value
+    assert error.__cause__ is None and error.__suppress_context__
+    frames = []
+    tb = error.__traceback__
+    while tb is not None:
+        frames.append(tb.tb_frame.f_code.co_name)
+        tb = tb.tb_next
+    # the traceback IPython keeps stops at the widget: quantem's frame and its arrays are gone
+    assert "interrupted_preprocess" not in frames
+    assert widget.status_message == "Interrupted" and widget.computing is False
+
+
+def test_fourier_tab_is_the_plain_fft_of_the_mean_pattern():
+    widget = ShowStrain(DATA, device="cpu")
+    expected = np.abs(np.fft.fftshift(np.fft.fft2(np.mean(DATA, axis=(0, 1)).astype(np.float64))))
+    shown = np.frombuffer(widget.dp_fft_bytes, np.float32, 64 * 64).reshape(64, 64)
+    np.testing.assert_allclose(shown, expected.astype(np.float32), rtol=1e-6)
+    assert 0 < widget.dp_fft_vmax < expected.max()  # the DC peak does not set the contrast

@@ -6,8 +6,13 @@
  * view draws the float32 images it receives and turns interactions into trait
  * commits: a slider release, a dropped vector, a switch. While a pointer or a
  * slider moves, only browser-local previews change (the dragged vector and the
- * lattice it predicts, the peak candidates, the masked detector pixels), drawn
- * from refs once per animation frame; nothing reaches the kernel until release.
+ * lattice it predicts, the peak candidates, the masked detector pixels, the
+ * reference box), drawn from refs once per animation frame; nothing reaches the
+ * kernel until release.
+ *
+ * Layout: two large panels. Left: the mean diffraction pattern or a virtual
+ * real-space image of the scan. Right: the mean transform (lattice picking) or one
+ * strain component. Under them, every strain component side by side.
  *
  * Vectors are (row, col) offsets from the transform centre (rows // 2, cols // 2)
  * in transform pixels, whatever the zoom or pan.
@@ -24,21 +29,20 @@ import Slider, { type SliderProps } from "@mui/material/Slider";
 import Stack from "@mui/material/Stack";
 import Switch from "@mui/material/Switch";
 import Typography from "@mui/material/Typography";
-import { useTheme, type ThemeColors } from "../theme";
+import { useTheme, WIDGET_TYPOGRAPHY as typography, WIDGET_UI_FONT, type ThemeColors } from "../theme";
+import { SPACING, compactButton, controlRow, sliderStyles, switchStyles } from "../controlStyles";
 import { downloadBlob, extractBytes, extractFloat32, preserveRestoredWidgetModelsOnSave } from "../format";
 import { useHideStaticFallback } from "../staticFallback";
 import { COLORMAPS } from "../display/colormaps";
 import { createColormapEngine, type DisplayColormapEngine } from "../display/cpuColormap";
 import { RenderPathBadge } from "../shared/RenderPathBadge";
-import { sliderStyles } from "../controlStyles";
 import { drawScaleBarInRegion } from "../figure";
-import { findPeakCandidates, latticeSites, maskedPixels, type PeakCandidate } from "./peaks";
+import { findPeakCandidates, latticeSites, maskedPixels, percentileLinear, type PeakCandidate } from "./peaks";
+import { PIYG_LUT } from "./piyg";
 
-const FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
-const TRANSFORM_PX = 448;
-const DP_PX = 224;
-const STRAIN_MAX_H = 300;
-const STRAIN_MAX_W = 300;
+const PANEL_PX = 448;
+const SMALL_MAX_H = 200;
+const SMALL_MAX_W = 170;
 const COLORBAR_W = 44;
 const HIT_PX = 10;
 const CLICK_MOVE_PX = 4;
@@ -49,17 +53,26 @@ const VECTOR_COLORS = ["#ff4d4f", "#40a9ff"];
 const VECTOR_NAMES = ["g1", "g2"] as const;
 const PREVIEW_COLOR = "#36cfc9";
 const STRAIN_CMAP = "RdBu_r";
-// strain_bytes order (STRAIN_COMPONENTS in showstrain.py), then the fit weight
+// plot_strain's defaults: cmap_strain="RdBu_r", cmap_rotation="PiYG" (PiYG ships in this folder)
+const ROTATION_CMAP = "PiYG";
+const ROTATION_INDEX = 4;
+const LUTS: Record<string, Uint8Array> = { ...COLORMAPS, [ROTATION_CMAP]: PIYG_LUT };
+// strain_bytes order (STRAIN_COMPONENTS in showstrain.py: e_uu, e_vv, e_uv, planar, phi), then the fit weight
 const STRAIN_PANELS = [
-  { key: "e_rr", label: "e_rr", unit: "%" },
-  { key: "e_cc", label: "e_cc", unit: "%" },
-  { key: "e_rc", label: "e_rc", unit: "%" },
-  { key: "phi", label: "phi", unit: "deg" },
-  { key: "weight", label: "weight", unit: "" },
+  { key: "e_uu", label: "e_uu", unit: "%", scale: 100 },
+  { key: "e_vv", label: "e_vv", unit: "%", scale: 100 },
+  { key: "e_uv", label: "e_uv", unit: "%", scale: 100 },
+  { key: "planar", label: "planar", unit: "%", scale: 100, title: "Planar strain e_uu + e_vv" },
+  { key: "rotation", label: "rotation", unit: "deg", scale: 180 / Math.PI },
+  { key: "weight", label: "weight", unit: "", scale: 1 },
 ] as const;
+const N_STRAIN = 5;  // components in strain_bytes
+const WEIGHT_INDEX = 5;
 const SLOT_TRANSFORM = 0;
 const SLOT_DP = 1;
-const SLOT_STRAIN = 2;  // 2..6
+const SLOT_REAL = 2;
+const SLOT_STRAIN = 3;  // 3..8
+const SLOT_FFT = 9;
 
 type Vec = [number, number];
 type View = { zoom: number; panX: number; panY: number };
@@ -67,8 +80,10 @@ type Drag =
   | { mode: "pending"; startX: number; startY: number; startPanX: number; startPanY: number }
   | { mode: "pan"; startX: number; startY: number; startPanX: number; startPanY: number }
   | { mode: "vector"; index: 0 | 1; at: Vec };
-
-const compactButton = { fontSize: 11, py: 0.25, px: 1, minWidth: 0, textTransform: "none" as const };
+// Left: the cepstral transform and everything in scan space. Right: the diffraction-space
+// comparisons, hideable.
+type LeftTab = "transform" | "real" | 0 | 1 | 2 | 3 | 4;
+type RightTab = "diffraction" | "fourier";
 
 function clamp(value: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, value));
@@ -99,7 +114,7 @@ function CommitSlider({ onChange, onChangeCommitted, ...props }: SliderProps) {
   );
 }
 
-/** A bounded slider row: label, slider and a tabular value, kept together when the row wraps. */
+/** Label, slider and value as one unit that never splits when the row wraps (the toolbar rule). */
 function SliderPair(props: {
   label: string; ariaLabel: string; value: number | number[]; min: number; max: number; step: number;
   format: (v: number | number[]) => string; disabled?: boolean; width?: number; colors: ThemeColors;
@@ -108,7 +123,7 @@ function SliderPair(props: {
   const { colors } = props;
   return (
     <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" }} title={props.title}>
-      <Typography sx={{ fontSize: 11, color: colors.text }}>{props.label}</Typography>
+      <Typography sx={{ ...typography.label, color: colors.text }}>{props.label}</Typography>
       <CommitSlider
         size="small"
         aria-label={props.ariaLabel}
@@ -119,9 +134,9 @@ function SliderPair(props: {
         disabled={props.disabled}
         onChange={(_, v) => props.onChange(v)}
         onChangeCommitted={(_, v) => props.onCommit(v)}
-        sx={{ ...sliderStyles.small, width: props.width ?? 110, color: colors.accent }}
+        sx={{ ...sliderStyles.small, width: props.width ?? 100, color: colors.accent }}
       />
-      <Typography sx={{ fontSize: 11, fontFamily: "monospace", minWidth: 52, color: colors.text, fontVariantNumeric: "tabular-nums" }}>
+      <Typography sx={{ ...typography.value, minWidth: 52, color: colors.textMuted, fontVariantNumeric: "tabular-nums" }}>
         {props.format(props.value)}
       </Typography>
     </Box>
@@ -131,14 +146,49 @@ function SliderPair(props: {
 function SwitchPair(props: { label: string; checked: boolean; disabled?: boolean; colors: ThemeColors; onChange: (v: boolean) => void; title?: string }) {
   return (
     <Box sx={{ display: "inline-flex", alignItems: "center", gap: "2px", whiteSpace: "nowrap" }} title={props.title}>
-      <Typography sx={{ fontSize: 11, color: props.colors.text }}>{props.label}</Typography>
+      <Typography sx={{ ...typography.label, color: props.colors.text }}>{props.label}</Typography>
       <Switch
         size="small"
         checked={props.checked}
         disabled={props.disabled}
+        sx={switchStyles.small}
         slotProps={{ input: { "aria-label": props.label } }}
         onChange={(e) => props.onChange(e.target.checked)}
       />
+    </Box>
+  );
+}
+
+/** A row of text tabs above a panel; the active one is underlined in the accent color. */
+function TabBar<T extends string | number>(props: {
+  tabs: { value: T; label: string; disabled?: boolean; title?: string }[]; value: T; onChange: (v: T) => void;
+  colors: ThemeColors; ariaLabel: string;
+}) {
+  const { colors } = props;
+  return (
+    <Box role="tablist" aria-label={props.ariaLabel} sx={{ display: "flex", flexWrap: "wrap", gap: "2px", mb: "2px" }}>
+      {props.tabs.map((tab) => {
+        const active = tab.value === props.value;
+        return (
+          <Box
+            key={String(tab.value)}
+            component="button"
+            role="tab"
+            aria-selected={active}
+            disabled={tab.disabled}
+            title={tab.title}
+            onClick={() => !tab.disabled && props.onChange(tab.value)}
+            sx={{
+              ...typography.label, px: "8px", py: "3px", cursor: tab.disabled ? "default" : "pointer",
+              border: "none", background: "none", color: tab.disabled ? colors.textMuted : active ? colors.accent : colors.text,
+              opacity: tab.disabled ? 0.5 : 1, borderBottom: `2px solid ${active ? colors.accent : "transparent"}`,
+              fontWeight: active ? 600 : 400,
+            }}
+          >
+            {tab.label}
+          </Box>
+        );
+      })}
     </Box>
   );
 }
@@ -149,7 +199,7 @@ async function colormapToBitmap(
   vmin: number, vmax: number, cmap: string,
 ): Promise<ImageBitmap | null> {
   engine.uploadData(slot, data, width, height);
-  const out = await engine.renderSlotsToImageBitmapAsync([slot], [{ vmin, vmax }], false, cmap, COLORMAPS[cmap] ?? COLORMAPS.gray);
+  const out = await engine.renderSlotsToImageBitmapAsync([slot], [{ vmin, vmax }], false, cmap, LUTS[cmap] ?? COLORMAPS.gray);
   return out?.[0] ?? null;
 }
 
@@ -168,6 +218,35 @@ function logDisplay(values: Float32Array): { data: Float32Array; vmin: number; v
     if (v > hi) hi = v;
   }
   return { data, vmin: lo, vmax: hi > lo ? hi : lo + 1 };
+}
+
+/** A vertical colorbar beside a panel: its colormap, range and the zero tick. */
+function drawColorbar(canvas: HTMLCanvasElement | null, height: number, lut: Uint8Array, vmin: number, vmax: number, colors: ThemeColors) {
+  const ctx = canvas?.getContext("2d");
+  if (!ctx) return;
+  const barW = 8;
+  ctx.clearRect(0, 0, COLORBAR_W, height);
+  for (let y = 0; y < height; y++) {
+    const entry = Math.round((1 - y / Math.max(height - 1, 1)) * 255) * 3;
+    ctx.fillStyle = `rgb(${lut[entry]},${lut[entry + 1]},${lut[entry + 2]})`;
+    ctx.fillRect(0, y, barW, 1);
+  }
+  ctx.strokeStyle = colors.border;
+  ctx.strokeRect(0.5, 0.5, barW - 1, height - 1);
+  ctx.fillStyle = colors.text;
+  ctx.font = `9px ${WIDGET_UI_FONT}`;
+  ctx.textAlign = "left";
+  const fmt = (v: number) => (Math.abs(v) >= 10 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(2));
+  ctx.textBaseline = "top";
+  ctx.fillText(fmt(vmax), barW + 3, 0);
+  ctx.textBaseline = "bottom";
+  ctx.fillText(fmt(vmin), barW + 3, height);
+  if (vmin < 0 && vmax > 0 && height >= 40) {
+    const y = (vmax / (vmax - vmin)) * height;
+    ctx.textBaseline = "middle";
+    ctx.fillText("0", barW + 3, y);
+    ctx.fillRect(barW - 3, y, 3, 1);
+  }
 }
 
 function ShowStrainWidget() {
@@ -210,23 +289,29 @@ function ShowStrainWidget() {
   const [fitMethod, setFitMethod] = useModelState<string>("fit_method");
   const [refineDft, setRefineDft] = useModelState<boolean>("refine_dft");
   const [fitRequest, setFitRequest] = useModelState<number>("fit_request");
+  const [fitRadius, setFitRadius] = useModelState<number | null>("fit_refine_radius_px");
+  const [fitProgress] = useModelState<{ done?: number; total?: number; elapsed_s?: number }>("fit_progress");
 
   const [croppingFactor] = useModelState<number>("cropping_factor");
   const [strainRange, setStrainRange] = useModelState<number[]>("strain_range_percent");
   const [rotationRange, setRotationRange] = useModelState<number[]>("rotation_range_degrees");
+  const [applyMask, setApplyMask] = useModelState<boolean>("apply_mask");
+  const [maskRange, setMaskRange] = useModelState<number[]>("mask_range");
+  const [rotationAngle, setRotationAngle] = useModelState<number>("rotation_angle");
   const [referenceRegion, setReferenceRegion] = useModelState<number[]>("reference_region");
   const [calculationMetric, setCalculationMetric] = useModelState<string>("calculation_metric");
   const [referenceVectors] = useModelState<number[][]>("reference_vectors");
   const [referenceMessage] = useModelState<string>("reference_message");
-  const [rotationAngle, setRotationAngle] = useModelState<number>("rotation_angle");
-  const [maskRange, setMaskRange] = useModelState<number[]>("mask_range");
-  const [fitRadius, setFitRadius] = useModelState<number | null>("fit_refine_radius_px");
-  const [fitProgress] = useModelState<{ done?: number; total?: number; elapsed_s?: number }>("fit_progress");
   const [peakColor, setPeakColor] = useModelState<string>("peak_color");
   const [peakLineWidth, setPeakLineWidth] = useModelState<number>("peak_line_width");
   const [peakSize, setPeakSize] = useModelState<number>("peak_size");
+  const [realSpaceMode, setRealSpaceMode] = useModelState<string>("real_space_mode");
+  const [realSpaceInfo] = useModelState<string>("real_space_info");
+  const [showDiffraction, setShowDiffraction] = useModelState<boolean>("show_diffraction");
 
   const [dpBytes] = useModelState<DataView>("dp_bytes");
+  const [dpFftBytes] = useModelState<DataView>("dp_fft_bytes");
+  const [dpFftVmax] = useModelState<number>("dp_fft_vmax");
   const [maskBytes] = useModelState<DataView>("mask_bytes");
   const [transformBytes] = useModelState<DataView>("transform_bytes");
   const [transformVmax] = useModelState<number>("transform_vmax");
@@ -236,6 +321,7 @@ function ShowStrainWidget() {
   const [peaksBytes] = useModelState<DataView>("peaks_bytes");
   const [strainBytes] = useModelState<DataView>("strain_bytes");
   const [weightBytes] = useModelState<DataView>("weight_bytes");
+  const [realSpaceBytes] = useModelState<DataView>("real_space_bytes");
   const [fitStale] = useModelState<boolean>("fit_stale");
   const [computing] = useModelState<boolean>("computing");
   const [statusMessage] = useModelState<string>("status_message");
@@ -253,6 +339,7 @@ function ShowStrainWidget() {
   // ---------------------------------------------------------------- decoded data
   const transform = React.useMemo(() => extractFloat32(transformBytes, dpRows * dpCols), [transformBytes, dpRows, dpCols]);
   const dp = React.useMemo(() => extractFloat32(dpBytes, dpRows * dpCols), [dpBytes, dpRows, dpCols]);
+  const dpFft = React.useMemo(() => extractFloat32(dpFftBytes, dpRows * dpCols), [dpFftBytes, dpRows, dpCols]);
   const mask = React.useMemo(() => extractFloat32(maskBytes, dpRows * dpCols), [maskBytes, dpRows, dpCols]);
   const peaks = React.useMemo(() => {
     const raw = extractFloat32(peaksBytes, nPeaks * 5);
@@ -261,8 +348,10 @@ function ShowStrainWidget() {
     for (let i = 0; i < nPeaks; i++) out.push({ row: raw[i * 5], col: raw[i * 5 + 1], weight: raw[i * 5 + 2] });
     return out;
   }, [peaksBytes, nPeaks]);
-  const strain = React.useMemo(() => extractFloat32(strainBytes, 4 * scanRows * scanCols), [strainBytes, scanRows, scanCols]);
+  const strain = React.useMemo(() => extractFloat32(strainBytes, N_STRAIN * scanRows * scanCols), [strainBytes, scanRows, scanCols]);
   const weight = React.useMemo(() => extractFloat32(weightBytes, scanRows * scanCols), [weightBytes, scanRows, scanCols]);
+  const realSpace = React.useMemo(() => extractFloat32(realSpaceBytes, scanRows * scanCols), [realSpaceBytes, scanRows, scanCols]);
+  const hasStrain = !!strain;
 
   // ---------------------------------------------------------------- engine
   const [engine, setEngine] = React.useState<DisplayColormapEngine | null>(null);
@@ -277,36 +366,37 @@ function ShowStrainWidget() {
     return () => { disposed = true; created?.destroy(); };
   }, []);
 
+  // ---------------------------------------------------------------- tabs
+  const [leftTab, setLeftTab] = React.useState<LeftTab>("transform");
+  const [rightTab, setRightTab] = React.useState<RightTab>("diffraction");
+  // the first fit opens e_uu; losing the strain (a refit pending) goes back to the transform
+  const hadStrainRef = React.useRef(hasStrain);
+  React.useEffect(() => {
+    if (hasStrain && !hadStrainRef.current) setLeftTab(0);
+    if (!hasStrain && typeof leftTab === "number") setLeftTab("transform");
+    hadStrainRef.current = hasStrain;
+  }, [hasStrain, leftTab]);
+
   // ---------------------------------------------------------------- local (preview) control values
-  const [localGamma, setLocalGamma] = React.useState(gamma);
-  React.useEffect(() => setLocalGamma(gamma), [gamma]);
-  const [localMaskPercentile, setLocalMaskPercentile] = React.useState(maskPercentile);
-  React.useEffect(() => setLocalMaskPercentile(maskPercentile), [maskPercentile]);
-  const [localEdgeBlend, setLocalEdgeBlend] = React.useState(maskEdgeBlend);
-  React.useEffect(() => setLocalEdgeBlend(maskEdgeBlend), [maskEdgeBlend]);
-  const [localRadius, setLocalRadius] = React.useState(refineRadius);
-  React.useEffect(() => setLocalRadius(refineRadius), [refineRadius]);
-  const [localThreshold, setLocalThreshold] = React.useState(thresholdPercentile);
-  React.useEffect(() => setLocalThreshold(thresholdPercentile), [thresholdPercentile]);
-  const [localSpacing, setLocalSpacing] = React.useState(minPeakSpacing);
-  React.useEffect(() => setLocalSpacing(minPeakSpacing), [minPeakSpacing]);
-  const [localStrainRange, setLocalStrainRange] = React.useState<number[]>(strainRange);
-  React.useEffect(() => setLocalStrainRange(strainRange), [strainRange]);
-  const [localRotationRange, setLocalRotationRange] = React.useState<number[]>(rotationRange);
-  React.useEffect(() => setLocalRotationRange(rotationRange), [rotationRange]);
-  const [localLogOffsetExp, setLocalLogOffsetExp] = React.useState(Math.log10(logOffset));
-  React.useEffect(() => setLocalLogOffsetExp(Math.log10(logOffset)), [logOffset]);
-  const [localMaskRange, setLocalMaskRange] = React.useState<number[]>(maskRange);
-  React.useEffect(() => setLocalMaskRange(maskRange), [maskRange]);
-  const [localRotationAngle, setLocalRotationAngle] = React.useState(rotationAngle);
-  React.useEffect(() => setLocalRotationAngle(rotationAngle), [rotationAngle]);
-  const shownFitRadius = fitRadius ?? refineRadius;
-  const [localFitRadius, setLocalFitRadius] = React.useState(shownFitRadius);
-  React.useEffect(() => setLocalFitRadius(shownFitRadius), [shownFitRadius]);
-  const [localPeakLineWidth, setLocalPeakLineWidth] = React.useState(peakLineWidth);
-  React.useEffect(() => setLocalPeakLineWidth(peakLineWidth), [peakLineWidth]);
-  const [localPeakSize, setLocalPeakSize] = React.useState(peakSize);
-  React.useEffect(() => setLocalPeakSize(peakSize), [peakSize]);
+  const useLocal = <T,>(value: T): [T, (v: T) => void] => {
+    const [local, setLocal] = React.useState<T>(value);
+    React.useEffect(() => setLocal(value), [value]);
+    return [local, setLocal];
+  };
+  const [localGamma, setLocalGamma] = useLocal(gamma);
+  const [localMaskPercentile, setLocalMaskPercentile] = useLocal(maskPercentile);
+  const [localEdgeBlend, setLocalEdgeBlend] = useLocal(maskEdgeBlend);
+  const [localRadius, setLocalRadius] = useLocal(refineRadius);
+  const [localThreshold, setLocalThreshold] = useLocal(thresholdPercentile);
+  const [localSpacing, setLocalSpacing] = useLocal(minPeakSpacing);
+  const [localStrainRange, setLocalStrainRange] = useLocal<number[]>(strainRange);
+  const [localRotationRange, setLocalRotationRange] = useLocal<number[]>(rotationRange);
+  const [localMaskRange, setLocalMaskRange] = useLocal<number[]>(maskRange);
+  const [localRotationAngle, setLocalRotationAngle] = useLocal(rotationAngle);
+  const [localFitRadius, setLocalFitRadius] = useLocal(fitRadius ?? refineRadius);
+  const [localPeakLineWidth, setLocalPeakLineWidth] = useLocal(peakLineWidth);
+  const [localPeakSize, setLocalPeakSize] = useLocal(peakSize);
+  const [localLogOffsetExp, setLocalLogOffsetExp] = useLocal(Math.log10(logOffset));
   const [contrast, setContrast] = React.useState(1);
 
   // Peak candidates the threshold / spacing sliders would give, while they differ from the committed values.
@@ -316,6 +406,9 @@ function ShowStrainWidget() {
     return findPeakCandidates(transform, dpRows, dpCols, localThreshold, localSpacing);
   }, [peakPreviewActive, transform, dpRows, dpCols, localThreshold, localSpacing]);
   const maskPreviewActive = diffractionMask && localMaskPercentile !== maskPercentile;
+  // the mask preview belongs to the diffraction panel; show it while its slider moves
+  React.useEffect(() => { if (maskPreviewActive) { setShowDiffraction(true); setRightTab("diffraction"); } }, [maskPreviewActive]);
+  React.useEffect(() => { if (peakPreviewActive) setLeftTab("transform"); }, [peakPreviewActive]);
 
   // ---------------------------------------------------------------- transform panel: refs + one rAF draw
   const transformCanvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -335,7 +428,7 @@ function ShowStrainWidget() {
   }, []);
   React.useEffect(() => () => { if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current); }, []);
 
-  const baseScale = dpRows > 0 && dpCols > 0 ? TRANSFORM_PX / Math.max(dpRows, dpCols) : 1;
+  const baseScale = dpRows > 0 && dpCols > 0 ? PANEL_PX / Math.max(dpRows, dpCols) : 1;
   const resetView = React.useCallback(() => {
     viewRef.current = { zoom: clamp(1 / (croppingFactor || 1), MIN_ZOOM, MAX_ZOOM), panX: 0, panY: 0 };
     requestDraw();
@@ -349,36 +442,90 @@ function ShowStrainWidget() {
     const { zoom, panX, panY } = viewRef.current;
     const s = baseScale * zoom;
     return [
-      TRANSFORM_PX / 2 + (centerCol + col + 0.5 - dpCols / 2) * s + panX,
-      TRANSFORM_PX / 2 + (centerRow + row + 0.5 - dpRows / 2) * s + panY,
+      PANEL_PX / 2 + (centerCol + col + 0.5 - dpCols / 2) * s + panX,
+      PANEL_PX / 2 + (centerRow + row + 0.5 - dpRows / 2) * s + panY,
     ];
   }, [baseScale, centerRow, centerCol, dpRows, dpCols]);
   const screenToOffset = React.useCallback((x: number, y: number): Vec => {
     const { zoom, panX, panY } = viewRef.current;
     const s = baseScale * zoom;
     return [
-      (y - TRANSFORM_PX / 2 - panY) / s + dpRows / 2 - 0.5 - centerRow,
-      (x - TRANSFORM_PX / 2 - panX) / s + dpCols / 2 - 0.5 - centerCol,
+      (y - PANEL_PX / 2 - panY) / s + dpRows / 2 - 0.5 - centerRow,
+      (x - PANEL_PX / 2 - panX) / s + dpCols / 2 - 0.5 - centerCol,
     ];
   }, [baseScale, centerRow, centerCol, dpRows, dpCols]);
+
+  // |r| in transform pixels and, when calibrated, in real-space units (sampling_real per pixel)
+  const calibrated = !!realUnits && realUnits !== "1/pixels" && samplingReal?.length === 2;
+  const realStep = calibrated ? (samplingReal[0] + samplingReal[1]) / 2 : 1;
+  const lengthLabel = (px: number) => (calibrated ? `|r| ${px.toFixed(2)} px = ${(px * realStep).toFixed(3)} ${realUnits}` : `|r| ${px.toFixed(2)} px`);
 
   // Shown vectors: the refined ones once Python returns them, else the picked seeds.
   const shownVectors: (Vec | null)[] = [asVec(g1Refined) ?? asVec(g1), asVec(g2Refined) ?? asVec(g2)];
   const seeds: (Vec | null)[] = [asVec(g1), asVec(g2)];
 
-  drawRef.current = () => {
+  const fftCanvasRef = React.useRef<HTMLCanvasElement>(null);
+  const fftBitmapRef = React.useRef<ImageBitmap | null>(null);
+  const fftHoverRef = React.useRef<{ x: number; y: number } | null>(null);
+  const fftDragRef = React.useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
+
+  // The plain |FFT| of the mean pattern, on the transform's zoom and pan, with the same basis,
+  // so the cepstral peaks can be compared spot for spot.
+  const drawFourierCanvas = () => {
+    const ctx = fftCanvasRef.current?.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = colors.bg;
+    ctx.fillRect(0, 0, PANEL_PX, PANEL_PX);
+    const { zoom, panX, panY } = viewRef.current;
+    const s = baseScale * zoom;
+    const bitmap = fftBitmapRef.current;
+    if (bitmap) ctx.drawImage(bitmap, PANEL_PX / 2 - (dpCols / 2) * s + panX, PANEL_PX / 2 - (dpRows / 2) * s + panY, dpCols * s, dpRows * s);
+    const [cx, cy] = offsetToScreen(0, 0);
+    shownVectors.forEach((vec, i) => {
+      if (!vec) return;
+      const [x, y] = offsetToScreen(vec[0], vec[1]);
+      ctx.strokeStyle = VECTOR_COLORS[i];
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.font = `bold 11px ${WIDGET_UI_FONT}`;
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = "rgba(0,0,0,0.85)";
+      ctx.strokeText(VECTOR_NAMES[i], x + 7, y - 5);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(VECTOR_NAMES[i], x + 7, y - 5);
+    });
+    drawScaleBarInRegion(ctx, { x: 0, y: 0, width: PANEL_PX, height: PANEL_PX }, zoom, s, realStep, calibrated ? realUnits : "px");
+    const readout = readoutRef.current;
+    const hover = fftHoverRef.current;
+    if (readout && hover && dpFft) {
+      const [row, col] = screenToOffset(hover.x, hover.y);
+      const pr = Math.round(row) + centerRow;
+      const pc = Math.round(col) + centerCol;
+      const value = pr >= 0 && pc >= 0 && pr < dpRows && pc < dpCols ? dpFft[pr * dpCols + pc] : NaN;
+      readout.textContent = `|FFT| (${row.toFixed(2)}, ${col.toFixed(2)}) px · ${lengthLabel(Math.hypot(row, col))} · ${Number.isFinite(value) ? value.toPrecision(4) : "-"}`;
+    }
+  };
+
+  const drawTransformCanvas = () => {
     const canvas = transformCanvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = colors.bg;
-    ctx.fillRect(0, 0, TRANSFORM_PX, TRANSFORM_PX);
+    ctx.fillRect(0, 0, PANEL_PX, PANEL_PX);
     const bitmap = transformBitmapRef.current;
     const { zoom, panX, panY } = viewRef.current;
     const s = baseScale * zoom;
     if (bitmap) {
-      ctx.drawImage(bitmap, TRANSFORM_PX / 2 - (dpCols / 2) * s + panX, TRANSFORM_PX / 2 - (dpRows / 2) * s + panY, dpCols * s, dpRows * s);
+      ctx.drawImage(bitmap, PANEL_PX / 2 - (dpCols / 2) * s + panX, PANEL_PX / 2 - (dpRows / 2) * s + panY, dpCols * s, dpRows * s);
     }
     const drag = dragRef.current;
     const vectors = shownVectors.slice();
@@ -391,20 +538,19 @@ function ShowStrainWidget() {
       ctx.lineWidth = 1;
       for (const [row, col] of latticeSites(vectors[0], vectors[1], dpRows / 2, dpCols / 2)) {
         const [x, y] = offsetToScreen(row, col);
-        if (x < -4 || y < -4 || x > TRANSFORM_PX + 4 || y > TRANSFORM_PX + 4) continue;
+        if (x < -4 || y < -4 || x > PANEL_PX + 4 || y > PANEL_PX + 4) continue;
         ctx.beginPath();
         ctx.moveTo(x - 3, y); ctx.lineTo(x + 3, y);
         ctx.moveTo(x, y - 3); ctx.lineTo(x, y + 3);
         ctx.stroke();
       }
     }
-    // committed refined peaks, radius by weight
+    // committed refined peaks, radius by weight, with a dark halo so the ring reads on bright peaks
     if (refineAllPeaks && peaks.length && !peakPreview) {
       const wmax = Math.max(...peaks.map((p) => Math.abs(p.weight)), 1e-30);
       for (const p of peaks) {
         const [x, y] = offsetToScreen(p.row, p.col);
         const radius = localPeakSize * (3 + 6 * Math.sqrt(Math.abs(p.weight) / wmax));
-        // dark halo under the colored ring keeps it visible on bright peaks
         ctx.strokeStyle = "rgba(0,0,0,0.75)";
         ctx.lineWidth = localPeakLineWidth + 2;
         ctx.beginPath();
@@ -460,7 +606,7 @@ function ShowStrainWidget() {
       ctx.lineTo(x - 8 * Math.cos(angle + 0.4), y - 8 * Math.sin(angle + 0.4));
       ctx.closePath();
       ctx.fill();
-      ctx.font = "bold 11px " + FONT;
+      ctx.font = `bold 11px ${WIDGET_UI_FONT}`;
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(0,0,0,0.85)";
       ctx.strokeText(VECTOR_NAMES[i], x + 7, y - 5);
@@ -471,9 +617,7 @@ function ShowStrainWidget() {
     ctx.beginPath();
     ctx.arc(cx, cy, 2, 0, 2 * Math.PI);
     ctx.fill();
-    const calibrated = realUnits && realUnits !== "1/pixels" && samplingReal?.length === 2;
-    drawScaleBarInRegion(ctx, { x: 0, y: 0, width: TRANSFORM_PX, height: TRANSFORM_PX }, zoom, s,
-      calibrated ? (samplingReal[0] + samplingReal[1]) / 2 : 1, calibrated ? realUnits : "px");
+    drawScaleBarInRegion(ctx, { x: 0, y: 0, width: PANEL_PX, height: PANEL_PX }, zoom, s, realStep, calibrated ? realUnits : "px");
 
     // hover readout, written straight to the DOM so a moving pointer never rerenders React
     const readout = readoutRef.current;
@@ -486,19 +630,15 @@ function ShowStrainWidget() {
         const pr = Math.round(row) + centerRow;
         const pc = Math.round(col) + centerCol;
         const value = pr >= 0 && pc >= 0 && pr < dpRows && pc < dpCols ? transform[pr * dpCols + pc] : NaN;
-        readout.textContent = `(${row.toFixed(2)}, ${col.toFixed(2)}) px · ${lengthLabel(Math.hypot(row, col))} · I ${Number.isFinite(value) ? value.toPrecision(4) : "-"}`;
+        readout.textContent = `transform (${row.toFixed(2)}, ${col.toFixed(2)}) px · ${lengthLabel(Math.hypot(row, col))} · I ${Number.isFinite(value) ? value.toPrecision(4) : "-"}`;
       }
     }
   };
-
-  // |r| in transform pixels and, when calibrated, in real-space units (sampling_real per pixel)
-  const lengthLabel = (px: number) => {
-    const calibrated = realUnits && realUnits !== "1/pixels" && samplingReal?.length === 2;
-    const s = calibrated ? (samplingReal[0] + samplingReal[1]) / 2 : 1;
-    return calibrated ? `|r| ${px.toFixed(2)} px = ${(px * s).toFixed(3)} ${realUnits}` : `|r| ${px.toFixed(2)} px`;
+  drawRef.current = () => {
+    drawTransformCanvas();
+    drawFourierCanvas();
   };
-
-  // redraw whenever anything the drawing reads changes
+  // redraw whenever anything the drawing reads changes (the canvas remounts when its tab returns)
   React.useEffect(() => { requestDraw(); });
 
   // colormap the transform (display only: vmin 0, vmax = brightest lattice peak x contrast)
@@ -514,6 +654,19 @@ function ShowStrainWidget() {
     return () => { cancelled = true; };
   }, [engine, transform, dpRows, dpCols, transformVmax, contrast, requestDraw]);
 
+  // the plain |FFT|: vmin 0, vmax = its brightest lattice peak (as the transform), same Contrast
+  React.useEffect(() => {
+    if (!engine || !dpFft || !dpRows || !dpCols) return;
+    let cancelled = false;
+    void colormapToBitmap(engine, SLOT_FFT, dpFft, dpCols, dpRows, 0, (dpFftVmax || 1) / contrast, "gray").then((bitmap) => {
+      if (cancelled) { bitmap?.close(); return; }
+      fftBitmapRef.current?.close();
+      fftBitmapRef.current = bitmap;
+      requestDraw();
+    });
+    return () => { cancelled = true; };
+  }, [engine, dpFft, dpRows, dpCols, dpFftVmax, contrast, requestDraw]);
+
   // ---------------------------------------------------------------- transform pointer handling
   const pendingClickRef = React.useRef<number | null>(null);
   const cancelPendingClick = () => {
@@ -521,9 +674,9 @@ function ShowStrainWidget() {
   };
   React.useEffect(() => () => cancelPendingClick(), []);
 
-  const canvasPoint = (e: React.PointerEvent | React.WheelEvent | React.MouseEvent): [number, number] => {
+  const panelPoint = (e: React.PointerEvent | React.WheelEvent | React.MouseEvent, size: number): [number, number] => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    return [(e.clientX - rect.left) * (TRANSFORM_PX / rect.width), (e.clientY - rect.top) * (TRANSFORM_PX / rect.height)];
+    return [(e.clientX - rect.left) * (size / rect.width), (e.clientY - rect.top) * (size / rect.height)];
   };
 
   const commitVectors = (next: (Vec | null)[]) => {
@@ -535,7 +688,7 @@ function ShowStrainWidget() {
   const handlePointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
     if (e.detail >= 2) { cancelPendingClick(); dragRef.current = null; return; }
-    const [x, y] = canvasPoint(e);
+    const [x, y] = panelPoint(e, PANEL_PX);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     if (!locked) {
       for (let i = 1; i >= 0; i--) {
@@ -554,7 +707,7 @@ function ShowStrainWidget() {
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
-    const [x, y] = canvasPoint(e);
+    const [x, y] = panelPoint(e, PANEL_PX);
     hoverRef.current = { x, y };
     const drag = dragRef.current;
     if (drag?.mode === "vector") {
@@ -576,7 +729,7 @@ function ShowStrainWidget() {
       next[drag.index] = drag.at;
       commitVectors(next);
     } else if (drag.mode === "pending" && !locked && (!seeds[0] || !seeds[1])) {
-      const [x, y] = canvasPoint(e);
+      const [x, y] = panelPoint(e, PANEL_PX);
       const at = screenToOffset(x, y);
       cancelPendingClick();
       pendingClickRef.current = window.setTimeout(() => {
@@ -597,18 +750,26 @@ function ShowStrainWidget() {
     const prevent = (e: WheelEvent) => e.preventDefault();
     box.addEventListener("wheel", prevent, { passive: false });
     return () => box.removeEventListener("wheel", prevent);
-  }, []);
+  }, [leftTab]);
+  const fftBoxRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    const box = fftBoxRef.current;
+    if (!box) return;
+    const prevent = (e: WheelEvent) => e.preventDefault();
+    box.addEventListener("wheel", prevent, { passive: false });
+    return () => box.removeEventListener("wheel", prevent);
+  }, [rightTab, showDiffraction]);
   const handleWheel = (e: React.WheelEvent) => {
-    const [x, y] = canvasPoint(e);
+    const [x, y] = panelPoint(e, PANEL_PX);
     const { zoom, panX, panY } = viewRef.current;
     const next = clamp(zoom * (e.deltaY > 0 ? 0.9 : 1.1), MIN_ZOOM, MAX_ZOOM);
-    const px = (x - TRANSFORM_PX / 2 - panX) / zoom;
-    const py = (y - TRANSFORM_PX / 2 - panY) / zoom;
-    viewRef.current = { zoom: next, panX: x - TRANSFORM_PX / 2 - px * next, panY: y - TRANSFORM_PX / 2 - py * next };
+    const px = (x - PANEL_PX / 2 - panX) / zoom;
+    const py = (y - PANEL_PX / 2 - panY) / zoom;
+    viewRef.current = { zoom: next, panX: x - PANEL_PX / 2 - px * next, panY: y - PANEL_PX / 2 - py * next };
     requestDraw();
   };
 
-  // ---------------------------------------------------------------- mean diffraction pattern + mask
+  // ---------------------------------------------------------------- mean diffraction pattern + detector mask
   const dpCanvasRef = React.useRef<HTMLCanvasElement>(null);
   const [dpBitmap, setDpBitmap] = React.useState<ImageBitmap | null>(null);
   React.useEffect(() => {
@@ -638,30 +799,84 @@ function ShowStrainWidget() {
     canvas.getContext("2d")?.putImageData(new ImageData(rgba, dpCols, dpRows), 0, 0);
     return canvas;
   }, [dp, mask, dpRows, dpCols, diffractionMask, maskPreviewActive, localMaskPercentile]);
-  const dpScale = dpRows && dpCols ? DP_PX / Math.max(dpRows, dpCols) : 1;
+  const dpScale = dpRows && dpCols ? PANEL_PX / Math.max(dpRows, dpCols) : 1;
   React.useLayoutEffect(() => {
     const ctx = dpCanvasRef.current?.getContext("2d");
     if (!ctx) return;
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = colors.bg;
-    ctx.fillRect(0, 0, DP_PX, DP_PX);
+    ctx.fillRect(0, 0, PANEL_PX, PANEL_PX);
     const w = dpCols * dpScale;
     const h = dpRows * dpScale;
-    if (dpBitmap) ctx.drawImage(dpBitmap, (DP_PX - w) / 2, (DP_PX - h) / 2, w, h);
-    if (maskOverlay) ctx.drawImage(maskOverlay, (DP_PX - w) / 2, (DP_PX - h) / 2, w, h);
-  }, [dpBitmap, maskOverlay, dpRows, dpCols, dpScale, colors.bg]);
+    if (dpBitmap) ctx.drawImage(dpBitmap, (PANEL_PX - w) / 2, (PANEL_PX - h) / 2, w, h);
+    if (maskOverlay) ctx.drawImage(maskOverlay, (PANEL_PX - w) / 2, (PANEL_PX - h) / 2, w, h);
+    drawScaleBarInRegion(ctx, { x: 0, y: 0, width: PANEL_PX, height: PANEL_PX }, 1, dpScale, 1, "px");
+  }, [dpBitmap, maskOverlay, dpRows, dpCols, dpScale, colors.bg, rightTab, showDiffraction]);
+  const dpReadoutMove = (e: React.PointerEvent) => {
+    const [x, y] = panelPoint(e, PANEL_PX);
+    const w = dpCols * dpScale;
+    const h = dpRows * dpScale;
+    const col = Math.floor((x - (PANEL_PX - w) / 2) / dpScale);
+    const row = Math.floor((y - (PANEL_PX - h) / 2) / dpScale);
+    const out = readoutRef.current;
+    if (!out || !dp || row < 0 || col < 0 || row >= dpRows || col >= dpCols) return;
+    const m = mask ? `, mask ${mask[row * dpCols + col].toFixed(2)}` : "";
+    out.textContent = `detector (${row}, ${col}) px · mean I ${dp[row * dpCols + col].toPrecision(4)}${m}`;
+  };
 
-  // ---------------------------------------------------------------- strain maps
-  const strainScale = scanRows && scanCols ? Math.min(STRAIN_MAX_H / scanRows, STRAIN_MAX_W / scanCols) : 1;
-  const strainW = Math.max(1, Math.round(scanCols * strainScale));
-  const strainH = Math.max(1, Math.round(scanRows * strainScale));
-  // plot_strain's frame: e_rr/e_cc/e_rc in the scan frame, e_uu/e_vv/e_uv once rotated
-  const strainNames = rotationAngle ? ["e_uu", "e_vv", "e_uv", "phi", "weight"] : ["e_rr", "e_cc", "e_rc", "phi", "weight"];
-  // plot_strain(mask_range): weight <= low is black, >= high full color, linear between
+  // ---------------------------------------------------------------- scan-space maps: real space, strain
+  const bigScale = scanRows && scanCols ? Math.min(PANEL_PX / scanRows, (PANEL_PX - COLORBAR_W) / scanCols) : 1;
+  const bigW = Math.max(1, Math.round(scanCols * bigScale));
+  const bigH = Math.max(1, Math.round(scanRows * bigScale));
+  const smallScale = scanRows && scanCols ? Math.min(SMALL_MAX_H / scanRows, SMALL_MAX_W / scanCols) : 1;
+  const smallW = Math.max(1, Math.round(scanCols * smallScale));
+  const smallH = Math.max(1, Math.round(scanRows * smallScale));
+
+  const strainDisplay = React.useMemo(() => {
+    if (!strain) return null;
+    const n = scanRows * scanCols;
+    const panels: Float32Array[] = [];
+    for (let k = 0; k < N_STRAIN; k++) {
+      const scale = STRAIN_PANELS[k].scale;  // percent, or degrees for the rotation
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = strain[k * n + i] * scale;
+      panels.push(out);
+    }
+    panels.push(weight ?? new Float32Array(n).fill(1));
+    return panels;
+  }, [strain, weight, scanRows, scanCols]);
+  const strainRanges = [localStrainRange, localStrainRange, localStrainRange, localStrainRange, localRotationRange, [0, 1]];
+  const strainCmap = (k: number) => (k === WEIGHT_INDEX ? "gray" : k === ROTATION_INDEX ? ROTATION_CMAP : STRAIN_CMAP);
+  const [strainBitmaps, setStrainBitmaps] = React.useState<(ImageBitmap | null)[]>([]);
+  React.useEffect(() => {
+    if (!engine || !strainDisplay) { setStrainBitmaps([]); return; }
+    let cancelled = false;
+    void Promise.all(strainDisplay.map((panel, k) => colormapToBitmap(
+      engine, SLOT_STRAIN + k, panel, scanCols, scanRows, strainRanges[k][0], strainRanges[k][1], strainCmap(k),
+    ))).then((bitmaps) => { if (!cancelled) setStrainBitmaps(bitmaps); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engine, strainDisplay, scanRows, scanCols, ...localStrainRange, ...localRotationRange]);
+
+  // the virtual image: robust 0.5-99.5 % window, gray
+  const [realBitmap, setRealBitmap] = React.useState<ImageBitmap | null>(null);
+  const realRange = React.useMemo(() => {
+    if (!realSpace) return null;
+    return [percentileLinear(realSpace, 0.5), percentileLinear(realSpace, 99.5)];
+  }, [realSpace]);
+  React.useEffect(() => {
+    if (!engine || !realSpace || !realRange) { setRealBitmap(null); return; }
+    let cancelled = false;
+    const [lo, hi] = realRange;
+    void colormapToBitmap(engine, SLOT_REAL, realSpace, scanCols, scanRows, lo, hi > lo ? hi : lo + 1, "gray")
+      .then((bitmap) => { if (!cancelled) setRealBitmap(bitmap); });
+    return () => { cancelled = true; };
+  }, [engine, realSpace, realRange, scanRows, scanCols]);
+
+  // plot_strain(mask_range) dimming, only while Mask is on: weight <= low is black, >= high full color
   const maskOverlayCanvas = React.useMemo(() => {
-    if (!weight || !scanRows || !scanCols) return null;
+    if (!applyMask || !weight || !scanRows || !scanCols) return null;
     const [low, high] = localMaskRange;
-    if (low <= 0 && high >= 1) return null;
     const rgba = new Uint8ClampedArray(scanRows * scanCols * 4);
     for (let i = 0; i < weight.length; i++) {
       const visible = clamp((weight[i] - low) / Math.max(high - low, 1e-12), 0, 1);
@@ -672,125 +887,74 @@ function ShowStrainWidget() {
     canvas.height = scanRows;
     canvas.getContext("2d")?.putImageData(new ImageData(rgba, scanCols, scanRows), 0, 0);
     return canvas;
-  }, [weight, scanRows, scanCols, localMaskRange]);
-  const strainRanges = [localStrainRange, localStrainRange, localStrainRange, localRotationRange, [0, 1]];
-  const colorbarRefs = React.useRef<(HTMLCanvasElement | null)[]>([]);
-  const strainCanvasRefs = React.useRef<(HTMLCanvasElement | null)[]>([]);
-  const [strainBitmaps, setStrainBitmaps] = React.useState<(ImageBitmap | null)[]>([]);
-  const strainDisplay = React.useMemo(() => {
-    if (!strain) return null;
-    const n = scanRows * scanCols;
-    const panels: Float32Array[] = [];
-    for (let k = 0; k < 4; k++) {
-      const scale = k === 3 ? 180 / Math.PI : 100;  // phi in degrees, the others in percent
-      const out = new Float32Array(n);
-      for (let i = 0; i < n; i++) out[i] = strain[k * n + i] * scale;
-      panels.push(out);
-    }
-    panels.push(weight ?? new Float32Array(n).fill(1));
-    return panels;
-  }, [strain, weight, scanRows, scanCols]);
-  React.useEffect(() => {
-    if (!engine || !strainDisplay) { setStrainBitmaps([]); return; }
-    let cancelled = false;
-    const ranges = [localStrainRange, localStrainRange, localStrainRange, localRotationRange, [0, 1]];
-    void Promise.all(strainDisplay.map((panel, k) => colormapToBitmap(
-      engine, SLOT_STRAIN + k, panel, scanCols, scanRows, ranges[k][0], ranges[k][1], k === 4 ? "gray" : STRAIN_CMAP,
-    ))).then((bitmaps) => { if (!cancelled) setStrainBitmaps(bitmaps); });
-    return () => { cancelled = true; };
-  }, [engine, strainDisplay, scanRows, scanCols, localStrainRange, localRotationRange]);
-  // Reference region: the committed box (solid) or the box being dragged (dashed), drawn on every
-  // panel so all five views of the selection move together. [row0, row1, col0, col1], half-open.
+  }, [applyMask, weight, scanRows, scanCols, localMaskRange]);
+
+  // Reference region: the committed box (solid) or the box being dragged (dashed), on every scan map.
+  // [row0, row1, col0, col1], half-open.
   const regionDragRef = React.useRef<{ start: Vec; end: Vec } | null>(null);
-  const strainHoverRef = React.useRef<{ k: number; row: number; col: number } | null>(null);
-  const strainReadoutRef = React.useRef<HTMLSpanElement>(null);
-  const strainFrameRef = React.useRef<number | null>(null);
-  const strainDrawRef = React.useRef<() => void>(() => {});
-  const requestStrainDraw = React.useCallback(() => {
-    if (strainFrameRef.current !== null) return;
-    strainFrameRef.current = window.requestAnimationFrame(() => {
-      strainFrameRef.current = null;
-      strainDrawRef.current();
+  const scanHoverRef = React.useRef<{ source: number | "real"; row: number; col: number } | null>(null);
+  const scanCanvasRefs = React.useRef<Record<string, HTMLCanvasElement | null>>({});
+  const scanFrameRef = React.useRef<number | null>(null);
+  const scanDrawRef = React.useRef<() => void>(() => {});
+  const requestScanDraw = React.useCallback(() => {
+    if (scanFrameRef.current !== null) return;
+    scanFrameRef.current = window.requestAnimationFrame(() => {
+      scanFrameRef.current = null;
+      scanDrawRef.current();
     });
   }, []);
-  React.useEffect(() => () => { if (strainFrameRef.current !== null) window.cancelAnimationFrame(strainFrameRef.current); }, []);
+  React.useEffect(() => () => { if (scanFrameRef.current !== null) window.cancelAnimationFrame(scanFrameRef.current); }, []);
   const regionFromDrag = (drag: { start: Vec; end: Vec }): number[] => [
     Math.min(drag.start[0], drag.end[0]), Math.max(drag.start[0], drag.end[0]) + 1,
     Math.min(drag.start[1], drag.end[1]), Math.max(drag.start[1], drag.end[1]) + 1,
   ];
-  strainDrawRef.current = () => {
+  const scanUnit = scanUnits && scanUnits !== "pixels" ? scanUnits : "px";
+
+  scanDrawRef.current = () => {
     const drag = regionDragRef.current;
     const region = drag ? regionFromDrag(drag) : (referenceRegion?.length === 4 ? referenceRegion : null);
-    strainBitmaps.forEach((bitmap, k) => {
-      const ctx = strainCanvasRefs.current[k]?.getContext("2d");
+    const drawMap = (key: string, bitmap: ImageBitmap | null, w: number, h: number, masked: boolean) => {
+      const ctx = scanCanvasRefs.current[key]?.getContext("2d");
       if (!ctx) return;
       ctx.imageSmoothingEnabled = false;
-      ctx.clearRect(0, 0, strainW, strainH);
-      if (bitmap) ctx.drawImage(bitmap, 0, 0, strainW, strainH);
-      if (maskOverlayCanvas && k < 4) ctx.drawImage(maskOverlayCanvas, 0, 0, strainW, strainH);
-      if (strainW >= 60) {
-        const unit = scanUnits && scanUnits !== "pixels" ? scanUnits : "px";
-        drawScaleBarInRegion(ctx, { x: 0, y: 0, width: strainW, height: strainH }, 1, strainScale, scanSampling || 1, unit,
-          { targetBarPx: Math.min(60, strainW * 0.35), margin: 8, barThickness: 3, color: "#000", barShadowColor: "#fff", outline: { color: "#fff", width: 3 } });
+      ctx.clearRect(0, 0, w, h);
+      if (bitmap) ctx.drawImage(bitmap, 0, 0, w, h);
+      if (masked && maskOverlayCanvas) ctx.drawImage(maskOverlayCanvas, 0, 0, w, h);
+      if (w >= 60) {
+        drawScaleBarInRegion(ctx, { x: 0, y: 0, width: w, height: h }, 1, w / scanCols, scanSampling || 1, scanUnit,
+          { targetBarPx: Math.min(60, w * 0.35), margin: 8, barThickness: 3, color: "#000", barShadowColor: "#fff", outline: { color: "#fff", width: 3 } });
       }
       if (!region) return;
-      const sx = strainW / scanCols;
-      const sy = strainH / scanRows;
+      const sx = w / scanCols;
+      const sy = h / scanRows;
       ctx.lineWidth = 1.5;
       ctx.setLineDash(drag ? [3, 2] : []);
       ctx.strokeStyle = drag ? PREVIEW_COLOR : "#000";
       ctx.strokeRect(region[2] * sx + 0.75, region[0] * sy + 0.75, (region[3] - region[2]) * sx - 1.5, (region[1] - region[0]) * sy - 1.5);
       ctx.setLineDash([]);
-    });
-    const out = strainReadoutRef.current;
-    const hover = strainHoverRef.current;
-    if (!out) return;
+    };
+    strainBitmaps.forEach((bitmap, k) => drawMap(`small-${k}`, bitmap, smallW, smallH, k !== WEIGHT_INDEX));
+    if (typeof leftTab === "number") drawMap("big", strainBitmaps[leftTab] ?? null, bigW, bigH, true);
+    if (leftTab === "real") drawMap("real", realBitmap, bigW, bigH, false);
+
+    const out = readoutRef.current;
+    const hover = scanHoverRef.current;
+    if (!out || !hover) return;
+    const position = scanUnit !== "px" ? ` = (${(hover.row * scanSampling).toFixed(2)}, ${(hover.col * scanSampling).toFixed(2)}) ${scanUnit}` : "";
     if (drag) {
       const [r0, r1, c0, c1] = regionFromDrag(drag);
       out.textContent = `reference rows ${r0}-${r1 - 1}, cols ${c0}-${c1 - 1} (${(r1 - r0) * (c1 - c0)} positions) · release to apply`;
-    } else if (hover && strainDisplay) {
-      const panel = { ...STRAIN_PANELS[hover.k], label: strainNames[hover.k] };
-      const value = strainDisplay[hover.k][hover.row * scanCols + hover.col];
-      const position = scanUnits && scanUnits !== "pixels"
-        ? ` = (${(hover.row * scanSampling).toFixed(2)}, ${(hover.col * scanSampling).toFixed(2)}) ${scanUnits}` : "";
-      out.textContent = `scan (${hover.row}, ${hover.col})${position} · ${panel.label} ${value.toFixed(hover.k === 4 ? 3 : 4)} ${panel.unit}`;
-    } else {
-      out.textContent = "";
+    } else if (hover.source === "real" && realSpace) {
+      out.textContent = `scan (${hover.row}, ${hover.col})${position} · ${realSpaceMode.toUpperCase()} ${realSpace[hover.row * scanCols + hover.col].toPrecision(4)}`;
+    } else if (typeof hover.source === "number" && strainDisplay) {
+      const panel = STRAIN_PANELS[hover.source];
+      const value = strainDisplay[hover.source][hover.row * scanCols + hover.col];
+      const w = weight ? ` · weight ${weight[hover.row * scanCols + hover.col].toFixed(3)}` : "";
+      out.textContent = `scan (${hover.row}, ${hover.col})${position} · ${panel.label} ${value.toFixed(hover.source === WEIGHT_INDEX ? 3 : 4)} ${panel.unit}${hover.source === WEIGHT_INDEX ? "" : w}`;
     }
   };
-  React.useLayoutEffect(() => { strainDrawRef.current(); }, [strainBitmaps, strainW, strainH, referenceRegion, maskOverlayCanvas]);
-  // one vertical colorbar per panel: its colormap, range and zero
-  React.useLayoutEffect(() => {
-    colorbarRefs.current.forEach((canvas, k) => {
-      const ctx = canvas?.getContext("2d");
-      if (!ctx) return;
-      const [vmin, vmax] = strainRanges[k];
-      const lut = COLORMAPS[k === 4 ? "gray" : STRAIN_CMAP];
-      const barW = 8;
-      ctx.clearRect(0, 0, COLORBAR_W, strainH);
-      for (let y = 0; y < strainH; y++) {
-        const entry = Math.round((1 - y / Math.max(strainH - 1, 1)) * 255) * 3;
-        ctx.fillStyle = `rgb(${lut[entry]},${lut[entry + 1]},${lut[entry + 2]})`;
-        ctx.fillRect(0, y, barW, 1);
-      }
-      ctx.strokeStyle = colors.border;
-      ctx.strokeRect(0.5, 0.5, barW - 1, strainH - 1);
-      ctx.fillStyle = colors.text;
-      ctx.font = `9px ${FONT}`;
-      ctx.textAlign = "left";
-      const fmt = (v: number) => (Math.abs(v) >= 10 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(2));
-      ctx.textBaseline = "top";
-      ctx.fillText(fmt(vmax), barW + 3, 0);
-      ctx.textBaseline = "bottom";
-      ctx.fillText(fmt(vmin), barW + 3, strainH);
-      if (vmin < 0 && vmax > 0 && strainH >= 40) {
-        const y = (vmax / (vmax - vmin)) * strainH;
-        ctx.textBaseline = "middle";
-        ctx.fillText("0", barW + 3, y);
-        ctx.fillRect(barW - 3, y, 3, 1);
-      }
-    });
-  }, [strainH, colors.text, colors.border, strainBitmaps, ...strainRanges.flat()]);
+  React.useLayoutEffect(() => { scanDrawRef.current(); });
+
   const scanPosition = (e: React.PointerEvent): Vec => {
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     return [
@@ -798,26 +962,40 @@ function ShowStrainWidget() {
       clamp(Math.floor(((e.clientX - rect.left) / rect.width) * scanCols), 0, scanCols - 1),
     ];
   };
-  const handleStrainDown = (e: React.PointerEvent) => {
-    if (e.button !== 0 || locked || fitStale) return;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    const at = scanPosition(e);
-    regionDragRef.current = { start: at, end: at };
-    requestStrainDraw();
-  };
-  const handleStrainMove = (k: number, e: React.PointerEvent) => {
-    const [row, col] = scanPosition(e);
-    strainHoverRef.current = { k, row, col };
-    if (regionDragRef.current) regionDragRef.current.end = [row, col];
-    requestStrainDraw();
-  };
-  const handleStrainUp = () => {
-    const drag = regionDragRef.current;
-    regionDragRef.current = null;
-    // a click without a drag leaves the reference alone
-    if (drag && (drag.start[0] !== drag.end[0] || drag.start[1] !== drag.end[1])) setReferenceRegion(regionFromDrag(drag));
-    requestStrainDraw();
-  };
+  // Dragging a box on any scan map sets the reference, once a fit exists.
+  const canPickReference = !locked && hasStrain && !fitStale;
+  const scanHandlers = (source: number | "real") => ({
+    onPointerDown: (e: React.PointerEvent) => {
+      if (e.button !== 0 || !canPickReference) return;
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      const at = scanPosition(e);
+      regionDragRef.current = { start: at, end: at };
+      requestScanDraw();
+    },
+    onPointerMove: (e: React.PointerEvent) => {
+      const [row, col] = scanPosition(e);
+      scanHoverRef.current = { source, row, col };
+      if (regionDragRef.current) regionDragRef.current.end = [row, col];
+      requestScanDraw();
+    },
+    onPointerUp: () => {
+      const drag = regionDragRef.current;
+      regionDragRef.current = null;
+      // a click without a drag leaves the reference alone
+      if (drag && (drag.start[0] !== drag.end[0] || drag.start[1] !== drag.end[1])) setReferenceRegion(regionFromDrag(drag));
+      requestScanDraw();
+    },
+    onPointerLeave: () => { scanHoverRef.current = null; },
+  });
+
+  // colorbars beside the big strain panel and every small one
+  const colorbarRefs = React.useRef<Record<string, HTMLCanvasElement | null>>({});
+  React.useLayoutEffect(() => {
+    const draw = (key: string, k: number, height: number) =>
+      drawColorbar(colorbarRefs.current[key] ?? null, height, LUTS[strainCmap(k)], strainRanges[k][0], strainRanges[k][1], colors);
+    STRAIN_PANELS.forEach((_, k) => draw(`small-${k}`, k, smallH));
+    if (typeof leftTab === "number") draw("big", leftTab, bigH);
+  });
 
   // ---------------------------------------------------------------- export
   const pendingExportRef = React.useRef<{ id: string; filename: string } | null>(null);
@@ -847,16 +1025,18 @@ function ShowStrainWidget() {
 
   // ---------------------------------------------------------------- layout
   const themedSelect = {
-    fontSize: 11, height: 24, bgcolor: colors.controlBg, color: colors.text,
+    fontSize: 10, height: 24, bgcolor: colors.controlBg, color: colors.text,
     "& .MuiSvgIcon-root": { color: colors.text },
     "& .MuiOutlinedInput-notchedOutline": { borderColor: colors.border },
     "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: colors.accent },
   };
   const menuProps = { PaperProps: { sx: { bgcolor: colors.controlBg, color: colors.text, "& .MuiMenuItem-root": { fontSize: 11 } } } };
+  // one bordered control row per step, as the other widgets' toolbars
+  const row = { ...controlRow, border: `1px solid ${colors.border}`, bgcolor: colors.controlBg, mb: `${SPACING.XS}px` };
   const sectionLabel = (text: string) => (
-    <Typography sx={{ fontSize: 11, fontWeight: 600, color: colors.text, minWidth: 64 }}>{text}</Typography>
+    <Typography sx={{ ...typography.label, fontWeight: 600, color: colors.text, minWidth: 58 }}>{text}</Typography>
   );
-  const row = { display: "flex", flexWrap: "wrap" as const, alignItems: "center", columnGap: "14px", rowGap: "4px", py: "3px" };
+  const button = { ...compactButton, color: colors.accent };
   const isError = /^Error/.test(statusMessage || "");
   const vectorReadout = (i: 0 | 1) => {
     const seed = seeds[i];
@@ -872,125 +1052,226 @@ function ShowStrainWidget() {
     const cos = (a[0] * b[0] + a[1] * b[1]) / (Math.hypot(...a) * Math.hypot(...b));
     return (Math.acos(clamp(cos, -1, 1)) * 180) / Math.PI;
   })();
+  const strainLabel = (k: number) => `${STRAIN_PANELS[k].label}${STRAIN_PANELS[k].unit ? ` (${STRAIN_PANELS[k].unit})` : ""}`;
+  const panelBox = { border: `1px solid ${colors.border}`, width: PANEL_PX, height: PANEL_PX, position: "relative" as const, boxSizing: "content-box" as const };
+  const scanMapBox = { ...panelBox, display: "flex", alignItems: "center", justifyContent: "center", gap: "3px" };
 
   return (
-    <Box className="showstrain-root" sx={{ p: "12px", bgcolor: colors.bg, color: colors.text, fontFamily: FONT, width: "100%", boxSizing: "border-box" }}>
+    <Box className="showstrain-root" sx={{ p: "12px", bgcolor: colors.bg, color: colors.text, fontFamily: WIDGET_UI_FONT, width: "100%", boxSizing: "border-box" }}>
       <Stack direction="row" alignItems="center" sx={{ mb: "6px", flexWrap: "wrap", columnGap: "8px" }}>
-        <Typography sx={{ fontSize: 13, fontWeight: 600 }}>{title || "ShowStrain"}</Typography>
+        <Typography sx={{ ...typography.title, fontSize: 13, color: colors.text }}>{title || "ShowStrain"}</Typography>
         <RenderPathBadge colors={colors} />
-        <Typography sx={{ fontSize: 10, color: colors.textMuted }}>
+        <Typography sx={{ ...typography.labelSmall, color: colors.textMuted }}>
           {scanRows}×{scanCols} scan · {dpRows}×{dpCols} {dataDtype} · fit on {device}
         </Typography>
         <Box sx={{ flex: 1 }} />
-        <Button size="small" sx={{ ...compactButton, color: colors.accent }} onClick={resetView}>Reset View</Button>
+        <Button size="small" sx={button} onClick={resetView}>Reset View</Button>
         {exportEnabled && !offline && (
-          <Button size="small" sx={{ ...compactButton, color: colors.accent }} onClick={handleExport} title="Standalone HTML: float32 transform and strain maps">
-            Export HTML
-          </Button>
+          <Button size="small" sx={button} onClick={handleExport} title="Standalone HTML: float32 transform and strain maps">Export HTML</Button>
         )}
       </Stack>
 
+      {/* ------------------------------------------------ the two large panels */}
       <Stack direction="row" sx={{ flexWrap: "wrap", gap: "12px", alignItems: "flex-start" }}>
+        {/* left: the cepstral transform and the scan-space maps */}
         <Box>
-          <Typography sx={{ fontSize: 11, mb: "2px" }}>Mean diffraction (log)</Typography>
-          <Box sx={{ border: `1px solid ${colors.border}`, width: DP_PX, height: DP_PX }}>
-            <canvas
-              ref={dpCanvasRef}
-              width={DP_PX}
-              height={DP_PX}
-              data-quantem-scientific-output={dpBitmap ? "showstrain-mean-diffraction" : undefined}
-              style={{ width: DP_PX, height: DP_PX, imageRendering: "pixelated", display: "block" }}
-            />
-          </Box>
-          <Typography sx={{ fontSize: 10, color: colors.textMuted, mt: "2px", maxWidth: DP_PX }}>
-            {diffractionMask ? (maskPreviewActive ? "Cyan: pixels the threshold would mask" : "Red: masked detector (feathered)") : "No detector mask"}
-          </Typography>
-        </Box>
-
-        <Box>
-          <Typography sx={{ fontSize: 11, mb: "2px" }}>
-            Mean transform ({mode}{mode === "gamma" ? ` ${gamma}` : ""}{hannWindow ? ", Hann" : ""})
-          </Typography>
-          <Box ref={transformBoxRef} sx={{ border: `1px solid ${colors.border}`, width: TRANSFORM_PX, height: TRANSFORM_PX, position: "relative" }}>
-            <canvas
-              ref={transformCanvasRef}
-              width={TRANSFORM_PX}
-              height={TRANSFORM_PX}
-              aria-label="Mean transform"
-              data-quantem-scientific-output={transform ? "showstrain-transform" : undefined}
-              style={{ width: TRANSFORM_PX, height: TRANSFORM_PX, display: "block", cursor: locked ? "grab" : "crosshair", touchAction: "none", imageRendering: "pixelated" }}
-              onPointerDown={handlePointerDown}
-              onPointerMove={handlePointerMove}
-              onPointerUp={handlePointerUp}
-              onPointerLeave={() => { hoverRef.current = null; requestDraw(); }}
-              onDoubleClick={(e) => { e.preventDefault(); cancelPendingClick(); resetView(); }}
-              onWheel={handleWheel}
-            />
-            {computing && (
-              <Box sx={{ position: "absolute", top: 4, right: 6, fontSize: 10, px: "4px", bgcolor: "rgba(0,0,0,0.6)", color: "#fff" }}>
-                computing…
-              </Box>
+          <TabBar<LeftTab>
+            ariaLabel="Left panel" colors={colors} value={leftTab} onChange={setLeftTab}
+            tabs={[
+              { value: "transform", label: `Cepstral transform (${mode}${mode === "gamma" ? ` ${gamma}` : ""}${hannWindow ? ", Hann" : ""})` },
+              { value: "real", label: "Real space", title: "Virtual ADF or BF image of the scan; drag a box on it to set the strain reference" },
+              ...([0, 1, 2, 3, 4] as const).map((k) => ({
+                value: k as LeftTab, label: STRAIN_PANELS[k].label, disabled: !hasStrain,
+                title: hasStrain ? ("title" in STRAIN_PANELS[k] ? (STRAIN_PANELS[k] as { title: string }).title : undefined) : "Fit to see the strain",
+              })),
+            ]}
+          />
+          {leftTab === "transform" ? (
+            <Box ref={transformBoxRef} sx={panelBox}>
+              <canvas
+                ref={transformCanvasRef} width={PANEL_PX} height={PANEL_PX} aria-label="Mean transform"
+                data-quantem-scientific-output={transform ? "showstrain-transform" : undefined}
+                style={{ width: PANEL_PX, height: PANEL_PX, display: "block", cursor: locked ? "grab" : "crosshair", touchAction: "none", imageRendering: "pixelated" }}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                onPointerLeave={() => { hoverRef.current = null; requestDraw(); }}
+                onDoubleClick={(e) => { e.preventDefault(); cancelPendingClick(); resetView(); }}
+                onWheel={handleWheel}
+              />
+              {computing && (
+                <Box sx={{ position: "absolute", top: 4, right: 6, fontSize: 10, px: "4px", bgcolor: "rgba(0,0,0,0.6)", color: "#fff" }}>computing…</Box>
+              )}
+            </Box>
+          ) : leftTab === "real" ? (
+            <Box sx={scanMapBox}>
+              {realBitmap ? (
+                <canvas
+                  ref={(el) => { scanCanvasRefs.current.real = el; }} width={bigW} height={bigH} aria-label="Real space map"
+                  data-quantem-scientific-output="showstrain-real-space"
+                  style={{ width: bigW, height: bigH, imageRendering: "pixelated", display: "block", cursor: canPickReference ? "crosshair" : "default", touchAction: "none" }}
+                  {...scanHandlers("real")}
+                />
+              ) : computing && realSpaceMode ? (
+                <Typography sx={{ ...typography.label, color: colors.textMuted }}>Computing the real-space image…</Typography>
+              ) : locked ? (
+                <Typography sx={{ ...typography.label, color: colors.textMuted }}>Not computed before export</Typography>
+              ) : (
+                <Box sx={{ textAlign: "center", px: "24px" }}>
+                  <Button size="small" variant="outlined" disabled={computing} sx={{ ...button, borderColor: colors.border }}
+                    onClick={() => setRealSpaceMode(realSpaceMode || "adf")}>
+                    Compute {(realSpaceMode || "adf").toUpperCase()} Image
+                  </Button>
+                  <Typography sx={{ ...typography.labelSmall, color: colors.textMuted, mt: "6px" }}>
+                    Reads every pattern of the {scanRows}×{scanCols} scan once
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+          ) : (
+            <Box sx={{ ...scanMapBox, opacity: fitStale ? 0.45 : 1 }}>
+              <canvas
+                ref={(el) => { scanCanvasRefs.current.big = el; }} width={bigW} height={bigH} aria-label={`${STRAIN_PANELS[leftTab].key} map large`}
+                data-quantem-scientific-output={strainBitmaps[leftTab] ? `showstrain-${STRAIN_PANELS[leftTab].key}-large` : undefined}
+                style={{ width: bigW, height: bigH, imageRendering: "pixelated", display: "block", cursor: canPickReference ? "crosshair" : "default", touchAction: "none" }}
+                {...scanHandlers(leftTab)}
+              />
+              <canvas ref={(el) => { colorbarRefs.current.big = el; }} width={COLORBAR_W} height={bigH}
+                aria-label={`${STRAIN_PANELS[leftTab].label} colorbar large`} style={{ width: COLORBAR_W, height: bigH, display: "block" }} />
+            </Box>
+          )}
+          <Box sx={{ display: "flex", alignItems: "center", gap: "8px", mt: "2px", minHeight: 22, maxWidth: PANEL_PX, flexWrap: "wrap" }}>
+            {leftTab === "transform" ? (
+              <Typography sx={{ ...typography.labelSmall, color: colors.textMuted }}>
+                {locked
+                  ? "Standalone page: zoom, pan and hover work; rerun in Jupyter to change the lattice."
+                  : !seeds[0] ? "Click a lattice peak to place g1. Scroll to zoom, drag to pan, double-click to reset."
+                  : !seeds[1] ? "Click a second, non-collinear peak to place g2."
+                  : "Drag a vector tip to re-seed it; the lattice it predicts follows the pointer."}
+              </Typography>
+            ) : leftTab === "real" ? (
+              <>
+                <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                  <Typography sx={{ ...typography.label, color: colors.text }}>Detector</Typography>
+                  <Select size="small" value={realSpaceMode || "adf"} disabled={locked} sx={themedSelect} MenuProps={menuProps}
+                    inputProps={{ "aria-label": "Real space detector" }} onChange={(e) => setRealSpaceMode(String(e.target.value))}>
+                    <MenuItem value="adf">ADF</MenuItem>
+                    <MenuItem value="bf">BF</MenuItem>
+                  </Select>
+                </Box>
+                <Typography sx={{ ...typography.labelSmall, color: colors.textMuted }}>
+                  {realSpaceInfo}{realSpaceInfo && canPickReference ? " · drag a box to set the reference" : ""}
+                </Typography>
+              </>
+            ) : (
+              <Typography sx={{ ...typography.labelSmall, color: colors.textMuted }}>
+                {`${strainLabel(leftTab)}${fitStale ? " · parameters changed since the fit" : ""}${canPickReference ? " · drag a box to set the reference" : ""}`}
+              </Typography>
             )}
           </Box>
-          <Typography sx={{ fontSize: 10, color: colors.textMuted, mt: "2px", minHeight: 14, maxWidth: TRANSFORM_PX }}>
-            <span ref={readoutRef} style={{ color: colors.accent, fontFamily: "monospace" }} />
-          </Typography>
-          <Typography sx={{ fontSize: 10, color: colors.textMuted, maxWidth: TRANSFORM_PX }}>
-            {locked
-              ? "Standalone page: zoom, pan and hover work; rerun in Jupyter to change the lattice."
-              : !seeds[0] ? "Click a lattice peak to place g1. Scroll to zoom, drag to pan, double-click to reset."
-              : !seeds[1] ? "Click a second, non-collinear peak to place g2."
-              : "Drag a vector tip to re-seed it; the lattice it predicts follows the pointer."}
-          </Typography>
         </Box>
 
-        <Box sx={{ minWidth: 260, maxWidth: 420, fontSize: 11 }}>
-          {VECTOR_NAMES.map((name, i) => (
-            <Typography key={name} sx={{ fontSize: 11, fontFamily: "monospace", color: seeds[i] ? VECTOR_COLORS[i] : colors.textMuted }}>
-              {name} {vectorReadout(i as 0 | 1)}
-            </Typography>
+        {/* right: diffraction space, to compare against; the switch hides it */}
+        <Box>
+          <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+            {showDiffraction ? (
+              <TabBar<RightTab>
+                ariaLabel="Right panel" colors={colors} value={rightTab} onChange={setRightTab}
+                tabs={[
+                  { value: "diffraction", label: "Mean diffraction" },
+                  { value: "fourier", label: "Fourier transform", title: "|FFT| of the mean diffraction pattern (no intensity scaling or mask), on the cepstral transform's zoom and pan" },
+                ]}
+              />
+            ) : <Box />}
+            <SwitchPair label="Diffraction panel" checked={!!showDiffraction} colors={colors} onChange={setShowDiffraction}
+              title="Show the mean diffraction pattern and its Fourier transform beside the cepstral transform" />
+          </Box>
+          {showDiffraction && (rightTab === "diffraction" ? (
+            <Box sx={panelBox}>
+              <canvas
+                ref={dpCanvasRef} width={PANEL_PX} height={PANEL_PX} aria-label="Mean diffraction"
+                data-quantem-scientific-output={dpBitmap ? "showstrain-mean-diffraction" : undefined}
+                style={{ width: PANEL_PX, height: PANEL_PX, imageRendering: "pixelated", display: "block" }}
+                onPointerMove={dpReadoutMove}
+              />
+            </Box>
+          ) : (
+            <Box ref={fftBoxRef} sx={panelBox}>
+              <canvas
+                ref={fftCanvasRef} width={PANEL_PX} height={PANEL_PX} aria-label="Fourier transform"
+                data-quantem-scientific-output={dpFft ? "showstrain-fourier-transform" : undefined}
+                style={{ width: PANEL_PX, height: PANEL_PX, display: "block", cursor: "grab", touchAction: "none", imageRendering: "pixelated" }}
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                  const [x, y] = panelPoint(e, PANEL_PX);
+                  fftDragRef.current = { startX: x, startY: y, startPanX: viewRef.current.panX, startPanY: viewRef.current.panY };
+                }}
+                onPointerMove={(e) => {
+                  const [x, y] = panelPoint(e, PANEL_PX);
+                  fftHoverRef.current = { x, y };
+                  const drag = fftDragRef.current;
+                  if (drag) viewRef.current = { ...viewRef.current, panX: drag.startPanX + x - drag.startX, panY: drag.startPanY + y - drag.startY };
+                  requestDraw();
+                }}
+                onPointerUp={() => { fftDragRef.current = null; }}
+                onPointerLeave={() => { fftHoverRef.current = null; }}
+                onDoubleClick={(e) => { e.preventDefault(); resetView(); }}
+                onWheel={handleWheel}
+              />
+            </Box>
           ))}
-          {angle !== null && (
-            <Typography sx={{ fontSize: 11, fontFamily: "monospace" }}>angle(g1, g2) {angle.toFixed(2)}°</Typography>
-          )}
-          {refineAllPeaks && (
-            <Typography sx={{ fontSize: 11, fontFamily: "monospace", color: peakColor || "#ffd54f" }}>
-              {peakPreview ? <span style={{ color: PREVIEW_COLOR }}>{peakPreview.length} candidate peaks (preview)</span> : `${nPeaks} peaks in the lattice fit`}
-            </Typography>
-          )}
-          <Button
-            size="small"
-            disabled={locked || (!seeds[0] && !seeds[1])}
-            sx={{ ...compactButton, color: colors.accent, mt: "4px" }}
-            onClick={() => commitVectors([null, null])}
-          >
-            Clear Vectors
-          </Button>
-          <Typography
-            aria-label="ShowStrain status"
-            sx={{ fontSize: 11, mt: "6px", color: isError ? "#d32f2f" : colors.text, wordBreak: "break-word" }}
-          >
-            {statusMessage}
-          </Typography>
-          {(warningMessages || []).length > 0 && (
-            <Typography sx={{ fontSize: 10, color: colors.textMuted, mt: "2px" }} title={(warningMessages || []).join("\n")}>
-              quantem: {(warningMessages || [])[0]}{(warningMessages || []).length > 1 ? ` (+${warningMessages.length - 1} more)` : ""}
-            </Typography>
-          )}
-          {(localExportStatus || exportStatus) && (
-            <Typography sx={{ fontSize: 10, color: /^Export failed/.test(exportStatus || "") ? "#d32f2f" : colors.textMuted, mt: "2px" }}>
-              {localExportStatus || exportStatus}
+          {showDiffraction && (
+            <Typography sx={{ ...typography.labelSmall, color: colors.textMuted, mt: "2px", minHeight: 22, maxWidth: PANEL_PX }}>
+              {rightTab === "diffraction"
+                ? (diffractionMask ? (maskPreviewActive ? "Cyan: pixels the threshold would mask" : "Red: masked detector (feathered)") : "Log scale · no detector mask")
+                : "|FFT| of the mean pattern, no intensity scaling or mask · same zoom, pan and Contrast as the cepstral transform"}
             </Typography>
           )}
         </Box>
       </Stack>
 
+      {/* ------------------------------------------------ readouts and status */}
+      <Box sx={{ mt: "2px", mb: "6px" }}>
+        <Typography sx={{ ...typography.value, minHeight: 14, color: colors.accent }}>
+          <span ref={readoutRef} />
+        </Typography>
+        <Stack direction="row" sx={{ flexWrap: "wrap", columnGap: "16px", rowGap: "2px", alignItems: "baseline" }}>
+          {VECTOR_NAMES.map((name, i) => (
+            <Typography key={name} sx={{ ...typography.value, fontSize: 11, color: seeds[i] ? VECTOR_COLORS[i] : colors.textMuted }}>
+              {name} {vectorReadout(i as 0 | 1)}
+            </Typography>
+          ))}
+          {angle !== null && <Typography sx={{ ...typography.value, fontSize: 11, color: colors.text }}>angle {angle.toFixed(2)}°</Typography>}
+          {refineAllPeaks && (
+            <Typography sx={{ ...typography.value, fontSize: 11, color: peakPreview ? PREVIEW_COLOR : peakColor || "#ffd54f" }}>
+              {peakPreview ? `${peakPreview.length} candidate peaks (preview)` : `${nPeaks} peaks in the lattice fit`}
+            </Typography>
+          )}
+          <Button size="small" disabled={locked || (!seeds[0] && !seeds[1])} sx={button} onClick={() => commitVectors([null, null])}>Clear Vectors</Button>
+        </Stack>
+        <Typography aria-label="ShowStrain status" sx={{ ...typography.label, mt: "2px", color: isError ? "#d32f2f" : colors.text, wordBreak: "break-word" }}>
+          {statusMessage}
+        </Typography>
+        {(warningMessages || []).length > 0 && (
+          <Typography sx={{ ...typography.labelSmall, color: colors.textMuted }} title={(warningMessages || []).join("\n")}>
+            quantem: {(warningMessages || [])[0]}{(warningMessages || []).length > 1 ? ` (+${warningMessages.length - 1} more)` : ""}
+          </Typography>
+        )}
+        {(localExportStatus || exportStatus) && (
+          <Typography sx={{ ...typography.labelSmall, color: /^Export failed/.test(exportStatus || "") ? "#d32f2f" : colors.textMuted }}>
+            {localExportStatus || exportStatus}
+          </Typography>
+        )}
+      </Box>
+
+      {/* ------------------------------------------------ controls: one bordered row per step */}
       {showControls && (
-        <Box sx={{ mt: "8px", borderTop: `1px solid ${colors.border}`, pt: "4px" }}>
+        <Box>
           <Box sx={row}>
             {sectionLabel("Preprocess")}
             <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <Typography sx={{ fontSize: 11 }}>Mode</Typography>
+              <Typography sx={{ ...typography.label, color: colors.text }}>Mode</Typography>
               <Select size="small" value={mode} disabled={locked} sx={themedSelect} MenuProps={menuProps}
                 inputProps={{ "aria-label": "Mode" }} onChange={(e) => setMode(String(e.target.value))}>
                 {["linear", "log", "log-min", "gamma"].map((m) => <MenuItem key={m} value={m}>{m}</MenuItem>)}
@@ -1013,7 +1294,7 @@ function ShowStrainWidget() {
             <SwitchPair label="Hann" checked={hannWindow} disabled={locked} colors={colors} onChange={setHannWindow}
               title="Hann window before the FFT (needed for the cft method and DFT refinement)" />
             <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }} title="Average the mean transform over every skip-th scan row and column">
-              <Typography sx={{ fontSize: 11 }}>Skip</Typography>
+              <Typography sx={{ ...typography.label, color: colors.text }}>Skip</Typography>
               <Select size="small" value={skip} disabled={locked} sx={themedSelect} MenuProps={menuProps}
                 inputProps={{ "aria-label": "Skip" }} onChange={(e) => setSkip(Number(e.target.value))}>
                 {Array.from(new Set([1, 2, 3, 4, 5, 10, 20, 50, skip])).sort((a, b) => a - b).map((s) => (
@@ -1023,19 +1304,20 @@ function ShowStrainWidget() {
                 ))}
               </Select>
             </Box>
-            <SwitchPair label="Mask" checked={diffractionMask} disabled={locked} colors={colors} onChange={setDiffractionMask}
+            <SwitchPair label="Detector mask" checked={diffractionMask} disabled={locked} colors={colors} onChange={setDiffractionMask}
               title="Mask detector pixels below a percentile of the mean pattern (diffraction_mask)" />
+            {diffractionMask && (
+              <>
+                <SliderPair label="Below" ariaLabel="Mask threshold percentile" colors={colors} value={localMaskPercentile} min={0} max={99} step={1}
+                  disabled={locked} format={(v) => `${(v as number).toFixed(0)} %`}
+                  onChange={(v) => setLocalMaskPercentile(v as number)} onCommit={(v) => setMaskPercentile(v as number)} />
+                <SliderPair label="Feather" ariaLabel="Mask edge blend" colors={colors} value={localEdgeBlend} min={1} max={128} step={1}
+                  disabled={locked} format={(v) => `${(v as number).toFixed(0)} px`}
+                  onChange={(v) => setLocalEdgeBlend(v as number)} onCommit={(v) => setMaskEdgeBlend(v as number)} />
+              </>
+            )}
           </Box>
-          {diffractionMask && (
-            <Box sx={{ ...row, pl: "78px" }}>
-              <SliderPair label="Mask below" ariaLabel="Mask threshold percentile" colors={colors} value={localMaskPercentile} min={0} max={99} step={1}
-                disabled={locked} format={(v) => `${(v as number).toFixed(0)} %`}
-                onChange={(v) => setLocalMaskPercentile(v as number)} onCommit={(v) => setMaskPercentile(v as number)} />
-              <SliderPair label="Feather" ariaLabel="Mask edge blend" colors={colors} value={localEdgeBlend} min={1} max={128} step={1}
-                disabled={locked} format={(v) => `${(v as number).toFixed(0)} px`}
-                onChange={(v) => setLocalEdgeBlend(v as number)} onCommit={(v) => setMaskEdgeBlend(v as number)} />
-            </Box>
-          )}
+
           <Box sx={row}>
             {sectionLabel("Lattice")}
             <SwitchPair label="Gaussian" checked={refineGaussian} disabled={locked} colors={colors} onChange={setRefineGaussian}
@@ -1045,42 +1327,40 @@ function ShowStrainWidget() {
               onChange={(v) => setLocalRadius(v as number)} onCommit={(v) => setRefineRadius(v as number)} />
             <SwitchPair label="Multi-peak" checked={refineAllPeaks} disabled={locked} colors={colors} onChange={setRefineAllPeaks}
               title="Fit the basis to every detected peak by weighted least squares (refine_all_peaks)" />
-            <Typography sx={{ fontSize: 11 }}>Contrast</Typography>
-            <Slider size="small" aria-label="Transform contrast" value={contrast} min={0.25} max={8} step={0.25}
-              onChange={(_, v) => setContrast(v as number)} sx={{ ...sliderStyles.small, width: 80, color: colors.accent }} />
+            {refineAllPeaks && (
+              <>
+                <SliderPair label="Threshold" ariaLabel="Peak threshold percentile" colors={colors} value={localThreshold} min={0.9} max={0.9995} step={0.0005}
+                  width={130} disabled={locked} format={(v) => (v as number).toFixed(4)}
+                  title="Keep local maxima above this quantile of the transform (threshold_percentile)"
+                  onChange={(v) => setLocalThreshold(v as number)} onCommit={(v) => setThresholdPercentile(v as number)} />
+                <SliderPair label="Spacing" ariaLabel="Minimum peak spacing" colors={colors} value={localSpacing} min={0} max={40} step={0.5}
+                  disabled={locked} format={(v) => `${(v as number).toFixed(1)} px`}
+                  title="Minimum distance between kept peaks, brightest first (min_peak_spacing; 0 = off)"
+                  onChange={(v) => setLocalSpacing(v as number)} onCommit={(v) => setMinPeakSpacing(v as number)} />
+              </>
+            )}
           </Box>
-          {refineAllPeaks && (
-            <Box sx={{ ...row, pl: "78px" }}>
-              <SliderPair label="Threshold" ariaLabel="Peak threshold percentile" colors={colors} value={localThreshold} min={0.9} max={0.9995} step={0.0005}
-                width={150} disabled={locked} format={(v) => (v as number).toFixed(4)}
-                title="Keep local maxima above this quantile of the transform (threshold_percentile)"
-                onChange={(v) => setLocalThreshold(v as number)} onCommit={(v) => setThresholdPercentile(v as number)} />
-              <SliderPair label="Spacing" ariaLabel="Minimum peak spacing" colors={colors} value={localSpacing} min={0} max={40} step={0.5}
-                disabled={locked} format={(v) => `${(v as number).toFixed(1)} px`}
-                title="Minimum distance between kept peaks, brightest first (min_peak_spacing; 0 = off)"
-                onChange={(v) => setLocalSpacing(v as number)} onCommit={(v) => setMinPeakSpacing(v as number)} />
+          <Box sx={row}>
+            {sectionLabel("Display")}
+            <SliderPair label="Contrast" ariaLabel="Transform contrast" colors={colors} value={contrast} min={0.25} max={8} step={0.25}
+              format={(v) => `${(v as number).toFixed(2)}x`} onChange={(v) => setContrast(v as number)} onCommit={() => {}} />
+            <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }} title="Color of the fitted peak circles (peak_color)">
+              <Typography sx={{ ...typography.label, color: colors.text }}>Peaks</Typography>
+              <input type="color" aria-label="Peak color" value={peakColor || "#ffd54f"} onChange={(e) => setPeakColor(e.target.value)}
+                style={{ width: 28, height: 20, padding: 0, border: `1px solid ${colors.border}`, background: "none", cursor: "pointer" }} />
             </Box>
-          )}
-          {refineAllPeaks && (
-            <Box sx={{ ...row, pl: "78px" }}>
-              <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }} title="Color of the fitted peak circles (peak_color)">
-                <Typography sx={{ fontSize: 11 }}>Peak color</Typography>
-                <input type="color" aria-label="Peak color" value={peakColor || "#ffd54f"}
-                  onChange={(e) => setPeakColor(e.target.value)}
-                  style={{ width: 28, height: 20, padding: 0, border: `1px solid ${colors.border}`, background: "none", cursor: "pointer" }} />
-              </Box>
-              <SliderPair label="Line" ariaLabel="Peak line width" colors={colors} value={localPeakLineWidth} min={0.5} max={6} step={0.5}
-                title="Circle line width in screen px (peak_line_width)" format={(v) => `${(v as number).toFixed(1)} px`}
-                onChange={(v) => setLocalPeakLineWidth(v as number)} onCommit={(v) => setPeakLineWidth(v as number)} />
-              <SliderPair label="Size" ariaLabel="Peak circle size" colors={colors} value={localPeakSize} min={0.5} max={4} step={0.25}
-                title="Circle radius scale; the radius also grows with the peak weight (peak_size)" format={(v) => `${(v as number).toFixed(2)}x`}
-                onChange={(v) => setLocalPeakSize(v as number)} onCommit={(v) => setPeakSize(v as number)} />
-            </Box>
-          )}
+            <SliderPair label="Line" ariaLabel="Peak line width" colors={colors} value={localPeakLineWidth} min={0.5} max={6} step={0.5}
+              width={70} title="Circle line width in screen px (peak_line_width)" format={(v) => `${(v as number).toFixed(1)} px`}
+              onChange={(v) => setLocalPeakLineWidth(v as number)} onCommit={(v) => setPeakLineWidth(v as number)} />
+            <SliderPair label="Size" ariaLabel="Peak circle size" colors={colors} value={localPeakSize} min={0.5} max={4} step={0.25}
+              width={70} title="Circle radius scale; the radius also grows with the peak weight (peak_size)" format={(v) => `${(v as number).toFixed(2)}x`}
+              onChange={(v) => setLocalPeakSize(v as number)} onCommit={(v) => setPeakSize(v as number)} />
+          </Box>
+
           <Box sx={row}>
             {sectionLabel("Fit")}
             <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-              <Typography sx={{ fontSize: 11 }}>Method</Typography>
+              <Typography sx={{ ...typography.label, color: colors.text }}>Method</Typography>
               <Select size="small" value={fitMethod} disabled={locked} sx={themedSelect} MenuProps={menuProps}
                 inputProps={{ "aria-label": "Fit method" }} onChange={(e) => setFitMethod(String(e.target.value))}>
                 <MenuItem value="gaussian">gaussian</MenuItem>
@@ -1094,107 +1374,113 @@ function ShowStrainWidget() {
             <SwitchPair label="DFT" checked={refineDft} disabled={locked || fitMethod === "cft"} colors={colors} onChange={setRefineDft}
               title="DFT-upsampled refinement after the Gaussian fit (needs Hann)" />
             <Button
-              size="small"
-              variant="outlined"
+              size="small" variant="outlined"
               disabled={locked || computing || !asVec(g1Refined) || !asVec(g2Refined)}
-              sx={{ ...compactButton, color: colors.accent, borderColor: colors.border }}
+              sx={{ ...button, borderColor: colors.border }}
               onClick={() => setFitRequest((fitRequest || 0) + 1)}
             >
-              Fit {scanRows * scanCols} Positions
+              {hasStrain ? "Refit" : "Fit"} {(scanRows * scanCols).toLocaleString()} Positions
             </Button>
-            {fitStale && <Typography sx={{ fontSize: 11, color: colors.accent }}>Parameters changed since the fit · Fit again</Typography>}
+            {fitStale && <Typography sx={{ ...typography.label, color: colors.accent }}>Parameters changed since the fit · Refit</Typography>}
+            {fitProgress?.total ? (() => {
+              const done = fitProgress.done ?? 0;
+              const total = fitProgress.total ?? 1;
+              const elapsed = fitProgress.elapsed_s ?? 0;
+              const left = done > 0 ? (elapsed * (total - done)) / done : NaN;
+              const clock = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)} min ${Math.round(sec % 60)} s` : `${Math.round(sec)} s`);
+              return (
+                <Box sx={{ minWidth: 240, flex: "1 1 240px", maxWidth: 520 }} aria-label="Fit progress">
+                  <LinearProgress variant="determinate" value={(100 * done) / total} sx={{ height: 6, borderRadius: 0 }} />
+                  <Typography sx={{ ...typography.value, color: colors.text, fontVariantNumeric: "tabular-nums", mt: "2px" }}>
+                    {done.toLocaleString()} / {total.toLocaleString()} positions · {clock(elapsed)}
+                    {Number.isFinite(left) && done < total ? ` · ~${clock(left)} left` : ""} on {device}
+                  </Typography>
+                </Box>
+              );
+            })() : null}
           </Box>
-          {fitProgress?.total ? (() => {
-            const done = fitProgress.done ?? 0;
-            const total = fitProgress.total ?? 1;
-            const elapsed = fitProgress.elapsed_s ?? 0;
-            const left = done > 0 ? (elapsed * (total - done)) / done : NaN;
-            const clock = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)} min ${Math.round(sec % 60)} s` : `${Math.round(sec)} s`);
-            return (
-              <Box sx={{ pl: "78px", pr: "8px", py: "2px", maxWidth: 640 }} aria-label="Fit progress">
-                <LinearProgress variant="determinate" value={(100 * done) / total} sx={{ height: 6, borderRadius: 0 }} />
-                <Typography sx={{ fontSize: 10, color: colors.text, fontVariantNumeric: "tabular-nums", mt: "2px" }}>
-                  {done.toLocaleString()} / {total.toLocaleString()} positions · {clock(elapsed)}
-                  {Number.isFinite(left) && done < total ? ` · ~${clock(left)} left` : ""} on {device}
-                </Typography>
+
+          {hasStrain && (
+            <Box sx={row}>
+              {sectionLabel("Strain")}
+              <SliderPair label="Strain ±" ariaLabel="Strain range percent" colors={colors}
+                value={Math.max(Math.abs(localStrainRange[0]), Math.abs(localStrainRange[1]))} min={0.05} max={10} step={0.05}
+                title="Symmetric color range, so zero strain is white (plot_strain strain_range_percent)"
+                format={(v) => `${(v as number).toFixed(2)} %`}
+                onChange={(v) => setLocalStrainRange([-(v as number), v as number])} onCommit={(v) => setStrainRange([-(v as number), v as number])} />
+              <SliderPair label="Rotation ±" ariaLabel="Rotation range degrees" colors={colors}
+                value={Math.max(Math.abs(localRotationRange[0]), Math.abs(localRotationRange[1]))} min={0.05} max={10} step={0.05}
+                title="Symmetric color range of the rotation (plot_strain rotation_range_degrees)"
+                format={(v) => `${(v as number).toFixed(2)}°`}
+                onChange={(v) => setLocalRotationRange([-(v as number), v as number])} onCommit={(v) => setRotationRange([-(v as number), v as number])} />
+              <SwitchPair label="Mask" checked={!!applyMask} colors={colors} onChange={setApplyMask}
+                title="Dim low-weight positions as plot_strain(mask_range=...) does" />
+              <SliderPair label="Range" ariaLabel="Mask range" colors={colors} value={localMaskRange} min={0} max={1} step={0.01}
+                disabled={!applyMask} width={110}
+                title="plot_strain mask_range: weight <= low is black, >= high full color"
+                format={(v) => `${(v as number[])[0].toFixed(2)}…${(v as number[])[1].toFixed(2)}`}
+                onChange={(v) => setLocalMaskRange(v as number[])} onCommit={(v) => setMaskRange(v as number[])} />
+              <SliderPair label="Rotation angle" ariaLabel="Rotation angle" colors={colors} value={localRotationAngle} min={-90} max={90} step={0.5}
+                disabled={locked || fitStale} width={90} title="plot_strain rotation_angle: e_uu, e_vv, e_uv in a frame rotated by this angle"
+                format={(v) => `${(v as number).toFixed(1)}°`}
+                onChange={(v) => setLocalRotationAngle(v as number)} onCommit={(v) => setRotationAngle(v as number)} />
+            </Box>
+          )}
+          {hasStrain && (
+            <Box sx={row}>
+              {sectionLabel("Reference")}
+              <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }} title="Statistic of the reference lattice over the region (update_reference calculation_metric)">
+                <Typography sx={{ ...typography.label, color: colors.text }}>Metric</Typography>
+                <Select size="small" value={calculationMetric} disabled={locked || fitStale} sx={themedSelect} MenuProps={menuProps}
+                  inputProps={{ "aria-label": "Reference metric" }} onChange={(e) => setCalculationMetric(String(e.target.value))}>
+                  <MenuItem value="median">median</MenuItem>
+                  <MenuItem value="mean">mean</MenuItem>
+                </Select>
               </Box>
-            );
-          })() : null}
+              <Button size="small" disabled={locked || fitStale || !(referenceRegion?.length === 4)} sx={button} onClick={() => setReferenceRegion([])}>
+                Reset Reference
+              </Button>
+              <Typography sx={{ ...typography.label, color: colors.text }} aria-label="Reference status">
+                {referenceMessage || "Drag a box on a strain or real-space map to choose the reference region."}
+              </Typography>
+              {referenceVectors?.length === 2 && (
+                <Typography sx={{ ...typography.value, color: colors.textMuted }} title="Reference vectors in the scan frame (after the detector-to-scan rotation)">
+                  g1_ref ({referenceVectors[0][0].toFixed(3)}, {referenceVectors[0][1].toFixed(3)}) · g2_ref ({referenceVectors[1][0].toFixed(3)}, {referenceVectors[1][1].toFixed(3)}) px
+                </Typography>
+              )}
+            </Box>
+          )}
         </Box>
       )}
 
+      {/* ------------------------------------------------ every component at once */}
       {strainDisplay && (
-        <Box sx={{ mt: "8px", borderTop: `1px solid ${colors.border}`, pt: "6px", opacity: fitStale ? 0.45 : 1 }}>
-          <Box sx={row}>
-            {sectionLabel("Strain")}
-            <SliderPair label="Strain ±" ariaLabel="Strain range percent" colors={colors}
-              value={Math.max(Math.abs(localStrainRange[0]), Math.abs(localStrainRange[1]))} min={0.05} max={10} step={0.05}
-              title="Symmetric color range, so zero strain is white (plot_strain strain_range_percent)"
-              format={(v) => `${(v as number).toFixed(2)} %`}
-              onChange={(v) => setLocalStrainRange([-(v as number), v as number])} onCommit={(v) => setStrainRange([-(v as number), v as number])} />
-            <SliderPair label="Rotation ±" ariaLabel="Rotation range degrees" colors={colors}
-              value={Math.max(Math.abs(localRotationRange[0]), Math.abs(localRotationRange[1]))} min={0.05} max={10} step={0.05}
-              title="Symmetric color range of phi (plot_strain rotation_range_degrees)"
-              format={(v) => `${(v as number).toFixed(2)}°`}
-              onChange={(v) => setLocalRotationRange([-(v as number), v as number])} onCommit={(v) => setRotationRange([-(v as number), v as number])} />
-            <SliderPair label="Mask" ariaLabel="Mask range" colors={colors} value={localMaskRange} min={0} max={1} step={0.01}
-              title="plot_strain mask_range: weight <= low is black, >= high full color"
-              format={(v) => `${(v as number[])[0].toFixed(2)}…${(v as number[])[1].toFixed(2)}`}
-              onChange={(v) => setLocalMaskRange(v as number[])} onCommit={(v) => setMaskRange(v as number[])} />
-            <SliderPair label="Frame" ariaLabel="Strain frame rotation" colors={colors} value={localRotationAngle} min={-90} max={90} step={0.5}
-              disabled={locked || fitStale} title="plot_strain rotation_angle: strain tensor in a frame rotated by this angle (e_uu, e_vv, e_uv)"
-              format={(v) => `${(v as number).toFixed(1)}°`}
-              onChange={(v) => setLocalRotationAngle(v as number)} onCommit={(v) => setRotationAngle(v as number)} />
-          </Box>
-          <Box sx={row}>
-            {sectionLabel("Reference")}
-            <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px" }} title="Statistic of the reference lattice over the region (update_reference calculation_metric)">
-              <Typography sx={{ fontSize: 11 }}>Metric</Typography>
-              <Select size="small" value={calculationMetric} disabled={locked || fitStale} sx={themedSelect} MenuProps={menuProps}
-                inputProps={{ "aria-label": "Reference metric" }} onChange={(e) => setCalculationMetric(String(e.target.value))}>
-                <MenuItem value="median">median</MenuItem>
-                <MenuItem value="mean">mean</MenuItem>
-              </Select>
-            </Box>
-            <Button size="small" disabled={locked || fitStale || !(referenceRegion?.length === 4)}
-              sx={{ ...compactButton, color: colors.accent }} onClick={() => setReferenceRegion([])}>
-              Reset Reference
-            </Button>
-            <Typography sx={{ fontSize: 11, color: colors.text }} aria-label="Reference status">
-              {referenceMessage || "Drag a box on a strain map to choose the reference region."}
-            </Typography>
-            {referenceVectors?.length === 2 && (
-              <Typography sx={{ fontSize: 10, fontFamily: "monospace", color: colors.textMuted }} title="Reference vectors in the scan frame (after the detector-to-scan rotation)">
-                g1_ref ({referenceVectors[0][0].toFixed(3)}, {referenceVectors[0][1].toFixed(3)}) · g2_ref ({referenceVectors[1][0].toFixed(3)}, {referenceVectors[1][1].toFixed(3)}) px
-              </Typography>
-            )}
-          </Box>
-          <Stack direction="row" sx={{ flexWrap: "wrap", gap: "10px", mt: "4px" }}>
+        <Box sx={{ mt: "6px", opacity: fitStale ? 0.45 : 1 }}>
+          <Stack direction="row" sx={{ flexWrap: "wrap", gap: "10px" }}>
             {STRAIN_PANELS.map((panel, k) => (
-              <Box key={panel.key}>
-                <Typography sx={{ fontSize: 11 }}>{strainNames[k]}{panel.unit ? ` (${panel.unit})` : ""}</Typography>
+              <Box key={panel.key} title={k < WEIGHT_INDEX ? "Click to show it large on the left" : undefined}>
+                <Typography
+                  sx={{ ...typography.label, color: leftTab === k ? colors.accent : colors.text, cursor: k < WEIGHT_INDEX ? "pointer" : "default" }}
+                  onClick={() => k < WEIGHT_INDEX && setLeftTab(k as LeftTab)}
+                >
+                  {strainLabel(k)}
+                </Typography>
                 <Stack direction="row" sx={{ gap: "3px" }}>
-                <canvas
-                  ref={(el) => { strainCanvasRefs.current[k] = el; }}
-                  width={strainW}
-                  height={strainH}
-                  data-quantem-scientific-output={strainBitmaps[k] ? `showstrain-${panel.key}` : undefined}
-                  aria-label={`${panel.key} map`}
-                  style={{ width: strainW, height: strainH, imageRendering: "pixelated", border: `1px solid ${colors.border}`, display: "block", cursor: locked ? "default" : "crosshair", touchAction: "none" }}
-                  onPointerDown={handleStrainDown}
-                  onPointerMove={(e) => handleStrainMove(k, e)}
-                  onPointerUp={handleStrainUp}
-                  onPointerLeave={() => { strainHoverRef.current = null; requestStrainDraw(); }}
-                />
-                <canvas ref={(el) => { colorbarRefs.current[k] = el; }} width={COLORBAR_W} height={strainH}
-                  aria-label={`${strainNames[k]} colorbar`} style={{ width: COLORBAR_W, height: strainH, display: "block" }} />
+                  <canvas
+                    ref={(el) => { scanCanvasRefs.current[`small-${k}`] = el; }}
+                    width={smallW} height={smallH}
+                    data-quantem-scientific-output={strainBitmaps[k] ? `showstrain-${panel.key}` : undefined}
+                    aria-label={`${panel.key} map`}
+                    style={{ width: smallW, height: smallH, imageRendering: "pixelated", border: `1px solid ${leftTab === k ? colors.accent : colors.border}`, display: "block", cursor: canPickReference ? "crosshair" : "default", touchAction: "none" }}
+                    onDoubleClick={() => k < WEIGHT_INDEX && setLeftTab(k as LeftTab)}
+                    {...scanHandlers(k)}
+                  />
+                  <canvas ref={(el) => { colorbarRefs.current[`small-${k}`] = el; }} width={COLORBAR_W} height={smallH}
+                    aria-label={`${panel.label} colorbar`} style={{ width: COLORBAR_W, height: smallH, display: "block" }} />
                 </Stack>
               </Box>
             ))}
           </Stack>
-          <Typography sx={{ fontSize: 10, color: colors.textMuted, mt: "2px", minHeight: 14 }}>
-            <span ref={strainReadoutRef} style={{ color: colors.accent, fontFamily: "monospace" }} />
-          </Typography>
         </Box>
       )}
     </Box>
@@ -1207,13 +1493,13 @@ function ShowStrainRoot() {
   const model = useModel();
   const rootRef = React.useRef<HTMLDivElement>(null);
   const [transformBytes] = useModelState<DataView>("transform_bytes");
-  const [preview] = useModelState<string>("_static_fallback_jpeg");
+  const [preview] = useModelState<string>("_static_fallback_image");
   const [previewMime] = useModelState<string>("_static_fallback_mime");
   const hasPixels = extractBytes(transformBytes).length > 0;
   useHideStaticFallback(model, rootRef, hasPixels);
   if (!hasPixels && preview) {
     return (
-      <div ref={rootRef} style={{ fontFamily: FONT, padding: 8 }}>
+      <div ref={rootRef} style={{ fontFamily: WIDGET_UI_FONT, padding: 8 }}>
         <img src={`data:${previewMime || "image/png"};base64,${preview}`} alt="Saved ShowStrain view" style={{ maxWidth: "100%", display: "block" }} />
         <div style={{ fontSize: 12, opacity: 0.7 }}>Saved preview · rerun the cell for interaction</div>
       </div>
