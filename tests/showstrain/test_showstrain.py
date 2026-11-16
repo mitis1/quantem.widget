@@ -39,16 +39,21 @@ SEEDS = {"g1": (8, 0), "g2": (0, 8)}
 PEAKS = {"refine_all_peaks": True, "threshold_percentile": 0.99, "min_peak_spacing": 4.0, "refine_radius_px": 1.5}
 
 
+def _quantem_kwargs(choose):
+    """The widget's lattice traits as choose_basis_vectors takes them (min_peak_spacing is min_spacing)."""
+    return {("min_spacing" if k == "min_peak_spacing" else k): v for k, v in choose.items()}
+
+
 def direct(data=DATA, *, mode="linear", gamma=0.5, choose=None, mask=None):
     """The notebook path: the same calls the widget makes, by hand."""
     work = StrainMapAutocorrelation.from_array(data)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if mask:
-            work.diffraction_mask(plot_mask=False, **mask)
-        work.preprocess(mode=mode, gamma=gamma, plot_transform=False)
+            work.diffraction_mask(plot=False, **mask)
+        work.preprocess(mode=mode, gamma=gamma, plot=False)
         if choose:
-            work.choose_lattice_vector(plot=False, **choose)
+            work.choose_basis_vectors(plot=False, **_quantem_kwargs(choose))
     return work
 
 
@@ -126,7 +131,7 @@ def test_fit_returns_the_workflow_strain_map_and_goes_stale_on_change():
     work = direct(choose={**SEEDS, **PEAKS})
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        work.fit_lattice_vectors(refine_radius_px=1.5, refine_all_peaks=True, device="cpu", progressbar=False)
+        work.fit_lattice(refine_radius_px=1.5, refine_all_peaks=True, device="cpu", progressbar=False)
     expected = work.calculate_strain_map()
     maps = np.frombuffer(widget.strain_bytes, np.float32, 5 * 30).reshape(5, 6, 5)
     # shown: e_uu, e_vv, e_uv (= e_rr, e_cc, e_rc at frame angle 0), planar e_uu + e_vv, rotation phi
@@ -226,7 +231,7 @@ def test_reference_region_matches_update_reference_without_refitting():
     expected = direct(choose={**SEEDS, **PEAKS})
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        expected.fit_lattice_vectors(refine_radius_px=1.5, refine_all_peaks=True, device="cpu", progressbar=False)
+        expected.fit_lattice(refine_radius_px=1.5, refine_all_peaks=True, device="cpu", progressbar=False)
     reference = expected.calculate_strain_map()
     mask = np.zeros((6, 5), dtype=bool)
     mask[:, 0:2] = True
@@ -296,15 +301,15 @@ def test_peak_overlay_style_is_validated_and_saved():
 
 
 def _stage_gpu_copy(widget, nbytes=4_000_000):
-    """Make the next fit leave a scan copy in _gpu_cache, as fit_lattice_vectors(save_to_gpu=True) does on a GPU."""
+    """Make the next fit leave a scan copy in _gpu_cache, as fit_lattice(save_to_gpu=True) does on a GPU."""
     work = widget.workflow
-    fit = work.fit_lattice_vectors
+    fit = work.fit_lattice
 
     def fit_with_copy(**kwargs):
         work._gpu_cache = torch.zeros(nbytes // 4, dtype=torch.float32)
         return fit(**kwargs)
 
-    work.fit_lattice_vectors = fit_with_copy
+    work.fit_lattice = fit_with_copy
 
 
 def test_the_gpu_copy_is_released_when_a_fit_ends():

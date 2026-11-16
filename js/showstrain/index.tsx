@@ -1368,7 +1368,7 @@ function ShowStrainWidget() {
               </Select>
             </Box>
             <SliderPair label="Fit radius" ariaLabel="Fit refine radius" colors={colors} value={localFitRadius} min={0.5} max={6} step={0.25}
-              disabled={locked} title="fit_lattice_vectors refine_radius_px (gaussian: fit window; cft: maximum peak move)"
+              disabled={locked} title="fit_lattice refine_radius_px (gaussian: fit window; cft: maximum peak move)"
               format={(v) => `${(v as number).toFixed(2)} px`}
               onChange={(v) => setLocalFitRadius(v as number)} onCommit={(v) => setFitRadius(v as number)} />
             <SwitchPair label="DFT" checked={refineDft} disabled={locked || fitMethod === "cft"} colors={colors} onChange={setRefineDft}

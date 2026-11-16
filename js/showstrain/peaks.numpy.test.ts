@@ -5,7 +5,7 @@ import { findPeakCandidates, latticeSites, maskedPixels, percentileLinear } from
 
 // Python reference: quantem.diffraction's StrainMapAutocorrelation on a synthetic
 // disk lattice. The drag previews must pick the same peaks as
-// choose_lattice_vector(refine_all_peaks=True) and mask the same detector pixels
+// choose_basis_vectors(refine_all_peaks=True) and mask the same detector pixels
 // as diffraction_mask, on the float32 image the browser receives. Skips when
 // $PYTHON (default "python") lacks the class.
 function strainReferenceFixture() {
@@ -35,18 +35,18 @@ data = np.stack([rng.poisson(dp * 300) / 300.0 for _ in range(6)]).reshape(2, 3,
 work = StrainMapAutocorrelation.from_array(data)
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    work.preprocess(mode="gamma", gamma=0.5, plot_transform=False)
+    work.preprocess(mode="gamma", gamma=0.5, plot=False)
 im32 = work.transform.array.astype(np.float32)
 cases = []
 for p, s in [(0.98, 0.0), (0.99, 0.0), (0.995, 3.0), (0.97, 6.5), (0.9, 10.0)]:
     _, _, pts, _, _ = _refine_lattice_vectors(
         im32.astype(np.float64), g1_rc=np.array([6.0, 0.0]), g2_rc=np.array([1.5, 7.0]),
-        refine_gaussian=False, refine_all_peaks=True, threshold_percentile=p, min_peak_spacing=s)
+        refine_gaussian=False, refine_all_peaks=True, threshold_percentile=p, min_spacing=s)
     cases.append({"p": p, "s": s, "peaks": np.round(pts).astype(int).tolist()})
 dp_mean = np.mean(data, axis=(0, 1))
 masks = []
 for q in (30.0, 50.0, 80.0):
-    work.diffraction_mask(threshold_percentile=q, edge_blend=3.0, plot_mask=False)
+    work.diffraction_mask(threshold_percentile=q, edge_blend=3.0, plot=False)
     masks.append({"q": q, "masked": (work.mask_diffraction == 0).astype(int).ravel().tolist()})
 print(json.dumps({"rows": det, "cols": det, "im": im32.astype(float).ravel().tolist(), "cases": cases,
                   "dp": dp_mean.astype(float).ravel().tolist(), "masks": masks,

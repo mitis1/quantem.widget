@@ -13,13 +13,13 @@ from quantem.widget import ShowStrain
 widget = ShowStrain(
     dataset,                      # Dataset4dstem, StrainMapAutocorrelation, or a 4D array
     mode="gamma", gamma=0.5,      # preprocess(...)
-    refine_all_peaks=True,        # choose_lattice_vector(...)
+    refine_all_peaks=True,        # choose_basis_vectors(...)
     threshold_percentile=0.98,
     min_peak_spacing=10,
     refine_radius_px=1.5,
-    fit_method="cft",             # fit_lattice_vectors(method=..., refine_radius_px=...)
+    fit_method="cft",             # fit_lattice(method=..., refine_radius_px=...)
     fit_refine_radius_px=3,
-    device="cuda:0",              # fit_lattice_vectors(device=...)
+    device="cuda:0",              # fit_lattice(device=...)
 )
 ```
 
@@ -50,8 +50,8 @@ one `StrainMapAutocorrelation` call:
 |---|---|---|
 | Detector mask (optional) | `diffraction_mask` | `diffraction_mask`, `mask_threshold_percentile`, `mask_edge_blend` |
 | Mean transform | `preprocess` | `mode`, `gamma`, `log_offset`, `log_offset_relative`, `hann_window`, `skip`, `q_to_r_rotation_ccw_deg`, `q_transpose` |
-| Lattice basis | `choose_lattice_vector` | `g1`, `g2`, `refine_gaussian`, `refine_radius_px`, `refine_all_peaks`, `threshold_percentile`, `min_peak_spacing` |
-| Per-position fit | `fit_lattice_vectors`, `calculate_strain_map` | `fit_method`, `fit_refine_radius_px` (defaults to `refine_radius_px`), `refine_dft`, `upsample`, `batch_size`, `device` |
+| Lattice basis | `choose_basis_vectors` | `g1`, `g2`, `refine_gaussian`, `refine_radius_px`, `refine_all_peaks`, `threshold_percentile`, `min_peak_spacing` |
+| Per-position fit | `fit_lattice`, `calculate_strain_map` | `fit_method`, `fit_refine_radius_px` (defaults to `refine_radius_px`), `refine_dft`, `upsample`, `batch_size`, `device` |
 | Reference lattice | `StrainMap.update_reference` | `reference_region`, `calculation_metric` |
 | Display frame | `StrainMap.rotate_strain` (`plot_strain(rotation_angle=)`) | `rotation_angle` |
 
@@ -98,7 +98,7 @@ region carries over.
 
 Vectors are `(row, col)` offsets from the transform centre `(dp_row // 2, dp_col // 2)`
 in transform pixels of the unrotated detector frame. This is the convention of
-`choose_lattice_vector(define_in_rotated=False)`. Zoom and pan never change them.
+`choose_basis_vectors(define_in_rotated_frame=False)`. Zoom and pan never change them.
 `threshold_percentile` is a fraction (0.98), while `mask_threshold_percentile` is a
 percent (50), matching the quantem arguments. The data are never copied, cropped,
 binned or cast. `skip` subsamples only the mean transform, exactly as `preprocess(skip=)`
@@ -111,7 +111,7 @@ constructing the widget raises `ImportError`, while importing `quantem.widget` s
 
 ## Memory
 
-quantem's `fit_lattice_vectors(save_to_gpu=True)` copies the whole scan to the GPU, about
+quantem's `fit_lattice(save_to_gpu=True)` copies the whole scan to the GPU, about
 19 GB for a 512 x 512 x 192 x 192 float32 scan. ShowStrain releases that copy and returns
 the allocator's cached blocks as soon as each fit ends, including when the fit fails or is
 interrupted. You don't need to restart the kernel or call `free()` yourself.

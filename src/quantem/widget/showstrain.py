@@ -38,7 +38,7 @@ from quantem.widget.utils.state_io import resolve_widget_version, unwrap_state_p
 
 _REQUIREMENT = (
     "ShowStrain needs quantem with quantem.diffraction.StrainMapAutocorrelation "
-    "(choose_lattice_vector(g1=..., g2=..., min_peak_spacing=...)). Install a quantem build that includes it."
+    "(choose_basis_vectors(g1=..., g2=..., min_spacing=...)). Install a quantem build that includes it."
 )
 MODES = ("linear", "log", "log-min", "gamma")
 FIT_METHODS = ("gaussian", "cft")
@@ -89,8 +89,8 @@ def _workflow_class():
         from quantem.diffraction import StrainMapAutocorrelation
     except ImportError as exc:
         raise ImportError(_REQUIREMENT) from exc
-    params = inspect.signature(StrainMapAutocorrelation.choose_lattice_vector).parameters
-    if not {"g1", "g2", "min_peak_spacing", "threshold_percentile"} <= set(params):
+    params = inspect.signature(StrainMapAutocorrelation.choose_basis_vectors).parameters
+    if not {"g1", "g2", "min_spacing", "threshold_percentile"} <= set(params):
         raise ImportError(_REQUIREMENT)
     return StrainMapAutocorrelation
 
@@ -139,16 +139,16 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
        edge_blend=mask_edge_blend)`` when ``diffraction_mask`` is on;
     2. ``preprocess(mode, gamma, log_offset, log_offset_relative, hann_window, skip,
        q_to_r_rotation_ccw_deg, q_transpose)``, the mean transform shown in the centre panel;
-    3. ``choose_lattice_vector(g1, g2, refine_gaussian, refine_radius_px, refine_all_peaks,
-       threshold_percentile, min_peak_spacing)`` once both vectors are picked;
-    4. :meth:`fit`: ``fit_lattice_vectors(...)`` on ``device`` and ``calculate_strain_map()``;
+    3. ``choose_basis_vectors(g1, g2, refine_gaussian, refine_radius_px, refine_all_peaks,
+       threshold_percentile, min_spacing)`` once both vectors are picked;
+    4. :meth:`fit`: ``fit_lattice(...)`` on ``device`` and ``calculate_strain_map()``;
     5. ``StrainMap.update_reference(strain_mask=reference_region, calculation_metric)``
        when a reference region is dragged on the strain maps (no refit).
 
     A slider release, a dropped vector or a switch reruns the steps it feeds; dragging only
     previews. Vectors are ``(row, col)`` offsets from the transform centre
     ``(dp_row // 2, dp_col // 2)`` in transform pixels of the unrotated detector frame,
-    the convention of ``choose_lattice_vector(define_in_rotated=False)``.
+    the convention of ``choose_basis_vectors(define_in_rotated_frame=False)``.
 
     Parameters
     ----------
@@ -361,7 +361,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
 
     @traitlets.validate("fit_method")
     def _validate_fit_method(self, proposal):
-        """``fit_lattice_vectors(method=...)``: "gaussian" or "cft"."""
+        """``fit_lattice(method=...)``: "gaussian" or "cft"."""
         value = str(proposal["value"]).strip().lower()
         if value not in FIT_METHODS:
             raise traitlets.TraitError(f"fit_method must be one of {FIT_METHODS}, got {proposal['value']!r}.")
@@ -411,7 +411,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
 
     @traitlets.validate("threshold_percentile")
     def _validate_threshold(self, proposal):
-        """A fraction in (0, 1), as ``choose_lattice_vector`` takes it (not a percent)."""
+        """A fraction in (0, 1), as ``choose_basis_vectors`` takes it (not a percent)."""
         value = float(proposal["value"])
         if not 0.0 < value < 1.0:
             raise traitlets.TraitError(f"threshold_percentile is a fraction in (0, 1), got {value!r}.")
@@ -494,7 +494,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
     def fit(self):
         """Fit the lattice vectors at every scan position and compute the strain map.
 
-        Runs ``fit_lattice_vectors`` on ``device`` with the current ``refine_gaussian``,
+        Runs ``fit_lattice`` on ``device`` with the current ``refine_gaussian``,
         ``refine_radius_px``, ``refine_all_peaks``, ``fit_method``, ``refine_dft``,
         ``upsample`` and ``batch_size``, then ``calculate_strain_map()``. The strain maps
         appear under the transform.
@@ -713,7 +713,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         start = time.perf_counter()
         if self.diffraction_mask:
             work.diffraction_mask(
-                threshold_percentile=self.mask_threshold_percentile, edge_blend=self.mask_edge_blend, plot_mask=False
+                threshold_percentile=self.mask_threshold_percentile, edge_blend=self.mask_edge_blend, plot=False
             )
             mask = np.asarray(work.mask_diffraction, dtype=np.float32)
         else:
@@ -730,7 +730,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             skip=None if self.skip == 1 else self.skip,
             q_to_r_rotation_ccw_deg=self.q_to_r_rotation_ccw_deg,
             q_transpose=self.q_transpose,
-            plot_transform=False,
+            plot=False,
         )
         elapsed = (time.perf_counter() - start) * 1e3
         transform = np.asarray(work.transform.array, dtype=np.float64)
@@ -748,7 +748,7 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         return f"Transform of {positions} patterns in {elapsed:.0f} ms"
 
     def _refine_lattice(self) -> str:
-        """``choose_lattice_vector`` with the picked vectors, or clear the result when one is missing."""
+        """``choose_basis_vectors`` with the picked vectors, or clear the result when one is missing."""
         work = self._workflow
         g1, g2 = _vector_or_none(self.g1), _vector_or_none(self.g2)
         self._last_lattice_key = self._lattice_key()
@@ -765,14 +765,14 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             raise ValueError(f"g1={g1} and g2={g2} are (nearly) parallel; pick two non-collinear peaks.")
         start = time.perf_counter()
         work.mean_img_peaks = work.mean_img_weights = work.mean_img_ab = None
-        work.choose_lattice_vector(
+        work.choose_basis_vectors(
             g1=g1,
             g2=g2,
             refine_gaussian=self.refine_gaussian,
             refine_radius_px=self.refine_radius_px,
             refine_all_peaks=self.refine_all_peaks,
             threshold_percentile=self.threshold_percentile,
-            min_peak_spacing=self.min_peak_spacing,
+            min_spacing=self.min_peak_spacing,
             plot=False,
         )
         elapsed = (time.perf_counter() - start) * 1e3
@@ -794,14 +794,14 @@ class ShowStrain(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         return f"Lattice refined{peaks} in {elapsed:.0f} ms"
 
     def _fit_and_strain(self) -> str:
-        """``fit_lattice_vectors`` on ``device``, then ``calculate_strain_map``."""
+        """``fit_lattice`` on ``device``, then ``calculate_strain_map``."""
         work = self._workflow
         start = time.perf_counter()
         self._cancel_idle_release()
         # The GPU copy of the scan quantem makes for the fit is released when it ends (also on an
         # error or an interrupt), unless keep_on_gpu holds it for the next fit until it idles out.
         with _progress_into(self), self._gpu_copy_scope():
-            work.fit_lattice_vectors(
+            work.fit_lattice(
                 refine_gaussian=self.refine_gaussian,
                 refine_dft=self.refine_dft,
                 refine_all_peaks=self.refine_all_peaks,
@@ -1047,7 +1047,7 @@ def _brightest_lattice_peak(transform: np.ndarray) -> float:
 def _progress_into(widget, interval_s: float = 0.25):
     """Route quantem's ``tqdm`` progress into ``widget.fit_progress`` for the duration of a fit.
 
-    ``fit_lattice_vectors(progressbar=True)`` imports ``tqdm.auto.tqdm`` when it starts, so a
+    ``fit_lattice(progressbar=True)`` imports ``tqdm.auto.tqdm`` when it starts, so a
     stand-in bound there for the call reports each finished batch to the browser (at most every
     ``interval_s``, and once at the end) and prints nothing. The original is always restored.
     """

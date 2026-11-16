@@ -32,7 +32,7 @@ export function percentileLinear(values: ArrayLike<number>, q: number, float32 =
 }
 
 /**
- * Peaks `choose_lattice_vector(refine_all_peaks=True)` starts from: pixels strictly
+ * Peaks `choose_basis_vectors(refine_all_peaks=True)` starts from: pixels strictly
  * greater than their 8 neighbours (periodic, as `np.roll`) and than the
  * `thresholdFraction` quantile of the image, in row-major order; with
  * `minSpacing > 0`, kept greedily from the brightest down when every kept peak
