@@ -1,4 +1,4 @@
-"""Regression shield for the ``save_state`` contract (Plot2D / Show1D / Show2D / Show3D / Show4DSTEM / ShowPDF).
+"""Regression shield for the ``save_state`` contract (Plot2D / Show1D / Show2D / Show3D / Show4DSTEM / ShowPDF / DiffractionSim).
 
 Background: an anywidget syncs its pixel buffers as ``sync=True`` traits. On
 notebook save, ipywidgets serializes those buffers into ``metadata.widgets`` -
@@ -20,6 +20,7 @@ import base64
 
 
 import io
+import json
 
 
 
@@ -33,7 +34,8 @@ import pytest
 from PIL import Image
 
 
-from quantem.widget import Plot2D, Show1D, Show2D, Show3D, Show4DSTEM
+from quantem.widget import DiffractionSim, Plot2D, Show1D, Show2D, Show3D, Show4DSTEM
+from quantem.widget._diffraction_sim_crystal import require_crystal_tools
 
 
 from quantem.widget.show4dstem.export import export_clone
@@ -52,6 +54,21 @@ try:  # ShowStrain needs quantem's StrainMapAutocorrelation
     _workflow_class()
 except ImportError:
     ShowStrain = None
+
+try:  # DiffractionSim needs quantem.diffraction (not installed on Intel Macs and Windows on ARM)
+    require_crystal_tools()
+    _DIFFRACTION_SIM_MISSING = ""
+except ImportError as exc:
+    _DIFFRACTION_SIM_MISSING = str(exc)
+
+
+def _frontend_png_b64() -> str:
+    """A PNG like the one the DiffractionSim frontend captures of its panels."""
+    rng = np.random.default_rng(0)
+    rgb = (rng.random((96, 192, 3)) * 255).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 IMAGE_MIME_KEYS = ("image/jpeg", "image/webp", "image/png")
@@ -99,6 +116,15 @@ def _mos2_like_stack(frames: int, rows: int, cols: int) -> np.ndarray:
 def _make(widget, **options):
     """Construct a small instance of each widget plus the trait key that carries
     its live-render pixels (the one that must survive the targeted send path)."""
+    if widget is DiffractionSim:
+        # The pattern is simulated in the browser, so the preview PNG comes
+        # from the frontend; set it here as the frontend would after a redraw.
+        # kossel_json (the Kikuchi reference) is the heavy key.
+        w = DiffractionSim("Al (fcc)", **options)
+        w.kossel_json = json.dumps({"shape": [8, 8], "data": "A" * 344})
+        if not options.get("save_state"):
+            w._static_fallback_jpeg = _frontend_png_b64()
+        return w, "kossel_json"
     if widget is Plot2D:
         data = np.arange(24, dtype=float).reshape(4, 6)
         return Plot2D(data, x=np.arange(6), y=np.arange(4), **options), "data_bytes"
@@ -129,9 +155,11 @@ WIDGETS = (
     [Plot2D, Show1D, Show2D, Show3D, Show4DSTEM]
     + ([ShowPDF] if ShowPDF is not None else [])
     + ([ShowStrain] if ShowStrain is not None else [])
+    + ([] if _DIFFRACTION_SIM_MISSING else [DiffractionSim])
 )
-# Line plots and annotated analysis views keep a lossless PNG preview; the image viewers a JPEG.
-PNG_PREVIEW_WIDGETS = (Plot2D, ShowPDF, ShowStrain)
+# Line plots, annotated analysis views and the browser-drawn DiffractionSim panels keep a lossless
+# PNG preview; the image viewers a JPEG.
+PNG_PREVIEW_WIDGETS = (Plot2D, ShowPDF, ShowStrain, DiffractionSim)
 
 
 @pytest.mark.parametrize("widget", WIDGETS)
@@ -444,7 +472,7 @@ def test_show2d_display_defers_static_png_render(monkeypatch):
     assert fill_meta == {"quantem.widget": {"static_fallback": True}}
 
 
-def test_docs_build_environment_is_not_quantem_core_config():
+def test_docs_build_environment_is_not_quantem_core_config(tmp_path):
     """quantem core reads every QUANTEM_* variable as its own config key and warns
     about unknown ones; the docs build printed that warning on every tutorial page."""
     import os
@@ -464,6 +492,8 @@ def test_docs_build_environment_is_not_quantem_core_config():
              "import quantem.core.config\n")
     # CI sets QUANTEM_GPU_SRC for the whole job (the bundle build reads it); only the docs step's own env is under test
     base = {k: v for k, v in os.environ.items() if not k.startswith("QUANTEM_")}
+    # This checks the docs step, independently of the developer's saved settings.
+    base["QUANTEM_CONFIG"] = str(tmp_path / "quantem-config")
     run = subprocess.run([sys.executable, "-c", probe], env={**base, **env},
                          capture_output=True, text=True)
     assert run.returncode == 0, run.stderr[-600:]
@@ -507,25 +537,51 @@ def test_show2d_sibling_static_output_via_nbconvert(tmp_path):
     Both are acceptable as long as the output can render statically and widget
     metadata stays tiny.
     """
+    import inspect
     import json
+    import os
+    from pathlib import Path
     import subprocess
     import sys
 
     import nbformat
 
+    # Pin both processes: `python -m jupyter nbconvert` can dispatch a
+    # different environment's executable from PATH, and a user's python3
+    # kernelspec can point at another installation.
+    kernel_name = "quantem-save-state-test"
+    kernel_dir = tmp_path / "jupyter" / "kernels" / kernel_name
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "kernel.json").write_text(json.dumps({
+        "argv": [sys.executable, "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+        "display_name": kernel_name,
+        "language": "python",
+        "env": {"PYTHONPATH": os.pathsep.join(str(Path(p).resolve()) for p in sys.path)},
+    }))
+    env = {
+        **os.environ,
+        "JUPYTER_PATH": str(tmp_path / "jupyter"),
+        "JUPYTER_CONFIG_DIR": str(tmp_path / "config"),
+    }
+    widget_source = str(Path(inspect.getfile(Show2D)).resolve())
     nb = nbformat.v4.new_notebook()
     nb.cells = [nbformat.v4.new_code_cell(
+        "import inspect, sys\n"
+        "from pathlib import Path\n"
         "import numpy as np\n"
         "from IPython.display import display\n"
         "from quantem.widget import Show2D\n"
-        "display(Show2D(np.random.rand(48, 48).astype('float32'), verbose=False))\n"
+        f"assert Path(sys.executable).resolve() == Path({sys.executable!r}).resolve()\n"
+        f"assert Path(inspect.getfile(Show2D)).resolve() == Path({widget_source!r})\n"
+        "display(Show2D(np.random.default_rng(17).random((48, 48), dtype=np.float32), verbose=False))\n"
     )]
     nb_path = tmp_path / "show2d_sibling.ipynb"
     nbformat.write(nb, nb_path)
     subprocess.run(
-        [sys.executable, "-m", "jupyter", "nbconvert", "--to", "notebook",
-         "--execute", "--inplace", str(nb_path)],
-        check=True, capture_output=True, timeout=180)
+        [sys.executable, "-m", "nbconvert", "--to", "notebook",
+         "--execute", f"--ExecutePreprocessor.kernel_name={kernel_name}",
+         "--inplace", str(nb_path)],
+        check=True, capture_output=True, timeout=180, env=env)
     executed = nbformat.read(nb_path, as_version=4)
     outputs = executed.cells[0].outputs
     display_outputs = [o for o in outputs if o.output_type == "display_data"]
@@ -549,19 +605,23 @@ def test_show2d_sibling_static_output_via_nbconvert(tmp_path):
         assert "quantem-static-fallback" in fallback.data["text/html"]
         assert fallback.metadata.get("quantem.widget", {}).get("static_fallback") is True
     # metadata.widgets guard. nbclient reconstructs widget state by replaying
-    # comm traffic, so two known constants of headless execution appear here no
-    # matter what get_state() trims: the anywidget JS bundle (_esm) and the
-    # initial 48x48 frame upload (~12 KB, needed for live render; a real Lab
-    # save goes through the trimmed get_state(), covered by
-    # test_full_snapshot_trims_bulk_buffers). Everything else must stay tiny -
-    # this fails if e.g. the static PNG or a duplicate pixel buffer starts
-    # leaking into the synced state.
+    # comm traffic, so the JS bundle and initial 48x48 live frame (~12 KB)
+    # appear here regardless of get_state() trimming. The single compact
+    # preview is intentional for cold reopen and must match the saved output.
+    # Everything else must stay tiny, including any accidental extra image or
+    # pixel buffer. Real Lab saves use the trimmed full snapshot tested below.
     widget_states = executed.metadata["widgets"]["application/vnd.jupyter.widget-state+json"]["state"]
     anymodel = next(s for s in widget_states.values() if s.get("model_name") == "AnyModel")
     body = dict(anymodel["state"])
     body.pop("_esm", None)
-    body.pop("_static_fallback_image", None)
-    body.pop("_static_fallback_mime", None)
+    preview = body.pop("_static_fallback_image")
+    assert body.pop("_static_fallback_mime") == image_key == "image/jpeg"
+    assert preview == fallback.data[image_key]
+    assert len(preview) < 200_000
+    with Image.open(io.BytesIO(base64.b64decode(preview, validate=True))) as image:
+        assert image.format == "JPEG"
+        assert min(image.size) > 10
+        assert np.asarray(image.convert("RGB")).std() > 0
     buffer_bytes = sum(len(b["data"]) for b in anymodel.get("buffers", []))
     assert buffer_bytes < 20_000
     assert len(json.dumps(body)) < 20_000
@@ -643,7 +703,7 @@ def test_show2d_static_gallery_avoids_pyplot_figure_manager(monkeypatch):
     widget = Show2D(
         [rng.random((96, 96), dtype=np.float32) for _ in range(4)],
         labels=["Ba", "Ti", "O", "Sr"],
-        ncols=2,
+        columns=2,
         cmap="inferno",
         save_state=False,
         verbose=False,
@@ -784,3 +844,15 @@ def test_show1d_save_state_true_keeps_buffers():
     full = w.get_state()
     assert "snapshot_bytes" in full
     assert "export_payload" in full
+
+
+@pytest.mark.skipif(bool(_DIFFRACTION_SIM_MISSING), reason=_DIFFRACTION_SIM_MISSING)
+def test_diffractionsim_frontend_capture_refreshes_saved_sibling():
+    """The DiffractionSim preview arrives from the frontend after the cell has
+    run, so each new capture must refill the saved-notebook sibling."""
+    w = DiffractionSim("Al (fcc)")
+    calls = []
+    w._static_fallback_fill = lambda: calls.append(w._static_png_b64())
+    png = _frontend_png_b64()
+    w._static_fallback_jpeg = png
+    assert calls == [png]

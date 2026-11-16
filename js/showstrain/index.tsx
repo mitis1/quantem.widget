@@ -25,7 +25,7 @@ import Button from "@mui/material/Button";
 import LinearProgress from "@mui/material/LinearProgress";
 import MenuItem from "@mui/material/MenuItem";
 import Select from "@mui/material/Select";
-import Slider, { type SliderProps } from "@mui/material/Slider";
+import Slider, { type SliderProps } from "../shared/Slider";
 import Stack from "@mui/material/Stack";
 import Switch from "@mui/material/Switch";
 import Typography from "@mui/material/Typography";
